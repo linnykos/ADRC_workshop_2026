@@ -1,0 +1,380 @@
+---
+title: "Week 1: A bird's-eye view of a single-cell workflow"
+author: "Kevin Z. Lin"
+date: "2026-07-27"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This tutorial runs a complete single-cell analysis end to end, from a raw count
+matrix to a UMAP with cell clusters, using **Seurat's default settings at every
+step**. The goal is not to make good choices yet — it is to see the whole
+skeleton at once, so that when we spend a full session on any one step you
+already know where it sits in the pipeline and what it is supposed to
+accomplish.
+
+The dataset is the 10x Genomics PBMC demonstration data (peripheral blood
+mononuclear cells, ~2,700 cells). It is small, clean, and well annotated, which
+makes it a good scaffold. Your own data will be messier.
+
+The workflow has six conceptual stages:
+
+| Stage | Question it answers | Seurat function |
+|---|---|---|
+| Load | What did the sequencer actually give me? | `Read10X`, `CreateSeuratObject` |
+| Quality control | Which barcodes are real, healthy cells? | `PercentageFeatureSet`, `subset` |
+| Normalization | How do I compare a cell with 10,000 counts to one with 1,000? | `NormalizeData` |
+| Feature selection | Which genes carry the biological signal? | `FindVariableFeatures` |
+| Dimension reduction | How do I compress 2,000 genes into a few axes? | `ScaleData`, `RunPCA` |
+| Clustering & visualization | Which cells belong together, and what does that look like? | `FindNeighbors`, `FindClusters`, `RunUMAP` |
+
+Reference material: the
+[Seurat essential commands](https://satijalab.org/seurat/articles/seurat5_essential_commands)
+and the
+[Seurat guided clustering tutorial](https://satijalab.org/seurat/articles/pbmc3k_tutorial),
+which this tutorial closely follows.
+
+# Setting up the Seurat object
+
+## Loading the counts
+
+`Read10X()` reads the three-file output of Cell Ranger (a barcode list, a
+feature list, and a sparse matrix) and returns a genes × cells matrix of UMI
+counts. Entry $(i,j)$ is the number of distinct mRNA molecules from gene $i$
+detected in cell $j$.
+
+You can download the data from [https://www.dropbox.com/scl/fi/9mn6q4clnjobfdsmpgshs/seurat-pbmc.zip?rlkey=z4ha1mdwcsoew6o712ciwfq5i&dl=0](https://www.dropbox.com/scl/fi/9mn6q4clnjobfdsmpgshs/seurat-pbmc.zip?rlkey=z4ha1mdwcsoew6o712ciwfq5i&dl=0).
+
+```{r}
+rm(list=ls())
+library(Seurat)
+pbmc.data <- Seurat::Read10X(data.dir = "/Users/kevinlin/Library/CloudStorage/Dropbox/Collaboration-and-People/sumie-katie/data/seurat-pbmc/filtered_feature_bc_matrix")
+```
+
+## Creating the object
+
+A `Seurat` object is a container. It holds the data (count matrices), the
+per-cell annotations (metadata), and the results of every analysis you run
+(PCA, clusters, UMAP). Everything downstream is "take the object, add something
+to it, hand it back" — which is why nearly every line below is
+`pbmc <- Something(pbmc, ...)`.
+
+```{r}
+pbmc <- Seurat::CreateSeuratObject(counts = pbmc.data,
+                                   project = "pbmc3k")
+pbmc
+```
+
+The printout tells you the two numbers that matter most: how many features
+(genes) and how many samples (cells) you have.
+
+## Looking inside the object
+
+Cell-level metadata is a data frame with one row per cell. Seurat starts you
+off with the total counts per cell (`nCount_RNA`) and the number of genes
+detected per cell (`nFeature_RNA`). This table is where QC metrics, cluster
+labels, and sample annotations accumulate as you go.
+
+```{r}
+head(pbmc@meta.data)
+```
+
+The count matrix itself is a sparse matrix — the vast majority of entries are
+zero, so R stores only the non-zeros. It still behaves like an ordinary matrix
+for indexing and arithmetic.
+
+```{r}
+count_mat <- SeuratObject::LayerData(pbmc,
+                                     layer = "counts",
+                                     assay = "RNA")
+count_mat[42:44,14:16]
+head(colSums(count_mat))
+head(pbmc$nCount_RNA)
+```
+
+Note that the last two lines agree: `nCount_RNA` is simply the column sums of
+the count matrix. Metadata columns are bookkeeping, not new information.
+
+Gene names and cell names are accessible directly:
+
+```{r}
+SeuratObject::Features(pbmc)[1:5]
+```
+
+```{r}
+Seurat::Cells(pbmc)[1:5]
+```
+
+# Quality control
+
+Not every barcode in the matrix is a healthy single cell. Some are empty
+droplets that caught only ambient RNA, some are dying cells leaking cytoplasm,
+some are two cells captured together. QC is the step where we compute a few
+per-cell summary statistics and use them to decide what to keep.
+
+## Mitochondrial fraction
+
+When a cell's membrane ruptures, cytoplasmic mRNA escapes but
+mitochondria-encoded transcripts stay behind. A high fraction of mitochondrial
+counts is therefore a signature of a stressed or dying cell. In human data
+these genes are the ones prefixed `MT-`.
+
+`PercentageFeatureSet()` computes, per cell, the percent of counts falling in a
+matching set of genes, and the `[[` assignment stashes it in the metadata.
+
+```{r}
+gene_vec <- SeuratObject::Features(pbmc)
+gene_vec[grep("^MT-", gene_vec)]
+
+pbmc[["percent.mt"]] <- Seurat::PercentageFeatureSet(pbmc,
+                                                     pattern = "^MT-")
+```
+
+## Ribosomal fraction
+
+The same machinery applied to ribosomal protein genes. Cells dominated by
+ribosomal transcripts often have little else going on, and the ribosomal
+fraction can vary systematically across cell types — it is worth computing and
+looking at, even if you do not filter on it.
+
+```{r}
+gene_vec[grep("^RPS", gene_vec)]
+pbmc[["percent.rb"]] <- Seurat::PercentageFeatureSet(pbmc,
+                                                     pattern = "^RPS")
+```
+
+## Cell cycle scores
+
+Proliferating cells express a coherent program of S-phase and G2/M genes. That
+program is real biology, but it is usually not the biology you care about, and
+it is strong enough to drive clustering on its own. Scoring it lets you check
+whether it is a problem for your data.
+
+`CellCycleScoring()` needs normalized values rather than raw counts, so we
+call `NormalizeData()` here to fill that slot. We will call it again later, after
+filtering — that repeat is intentional, not a mistake.
+See the [cell cycle vignette](https://satijalab.org/seurat/articles/cell_cycle_vignette.html)
+for what to do if the cycle turns out to dominate.
+
+```{r}
+pbmc <- Seurat::NormalizeData(pbmc)
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+pbmc <- Seurat::CellCycleScoring(pbmc,
+                                 s.features = s.genes,
+                                 g2m.features = g2m.genes)
+```
+
+Everything we computed now lives alongside the original metadata:
+
+```{r}
+head(pbmc@meta.data)
+```
+
+## Visualizing the QC metrics
+
+Always look at the distributions before choosing a threshold. Violin plots show
+you whether a metric is unimodal (one population, pick a tail cutoff) or has
+structure (possibly several cell types, in which case a single global cutoff
+will preferentially delete one of them).
+
+```{r}
+Seurat::VlnPlot(pbmc, features = c("nFeature_RNA",  "nCount_RNA", "percent.mt", "percent.rb"),
+                ncol = 4)
+```
+
+## Filtering
+
+The cutoffs below are the ones from the Seurat tutorial: drop cells with fewer
+than 200 genes detected (empty or dying), more than 2,500 genes (likely
+doublets), or more than 5% mitochondrial counts (damaged).
+
+These numbers are conventions, not laws. They were chosen for this dataset, and
+brain tissue in particular tolerates much higher mitochondrial fractions and
+yields far fewer genes per nucleus. Copying them onto your own data unexamined
+is the single most common way to silently throw away a cell type.
+
+```{r}
+pbmc <- subset(pbmc,
+               subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+```
+
+# Normalization
+
+Two cells with identical biology can have very different total counts, purely
+because of how efficiently each was captured and sequenced. Normalization
+removes that nuisance variation so that expression is comparable across cells.
+
+Seurat's default, `LogNormalize`, does three things per cell: divide each count
+by the cell's total, multiply by 10,000, and take `log(1 + x)`. The division
+puts cells on a common scale; the log compresses the very large values so that
+a handful of highly expressed genes do not dominate every downstream distance
+calculation.
+
+```{r}
+pbmc <- Seurat::NormalizeData(pbmc)
+```
+
+# Feature selection
+
+Most of the ~13,000 genes in the matrix are either off in nearly every cell or
+on at a similar level in every cell. Neither kind distinguishes cell types;
+both contribute noise. Restricting to the genes that vary the most across cells
+sharpens the signal and makes everything downstream faster.
+
+The complication is that in count data, variance grows with mean — highly
+expressed genes look variable simply because they are highly expressed. The
+`vst` method fits that mean–variance trend and ranks genes by how far they
+exceed it, so "variable" means variable *beyond what its expression level
+predicts*.
+
+```{r}
+pbmc <- Seurat::FindVariableFeatures(pbmc,
+                                     selection.method = "vst",
+                                     nfeatures = 2000)
+```
+
+The plot below shows every gene by mean expression and standardized variance,
+with the selected 2,000 in red. The labeled outliers are usually recognizable
+markers of specific cell types — a quick sanity check that feature selection is
+picking up biology.
+
+```{r}
+top10 <- head(Seurat::VariableFeatures(pbmc), 10)
+plot1 <- Seurat::VariableFeaturePlot(pbmc)
+plot1 <- Seurat::LabelPoints(plot = plot1,
+                             points = top10,
+                             repel = TRUE)
+plot1
+```
+
+# Dimension reduction
+
+## Scaling
+
+Even after normalization, genes differ in absolute expression level by orders
+of magnitude. PCA maximizes variance, so without further adjustment the highest
+expressed genes would define the leading components regardless of their
+biological relevance. `ScaleData()` centers each gene to mean 0 and scales it to
+variance 1, so every gene gets an equal vote.
+
+```{r}
+pbmc <- Seurat::ScaleData(pbmc)
+```
+
+## PCA
+
+We now have a ~2,000-dimensional space, which is both too large to compute in
+comfortably and mostly noise. PCA finds the directions of greatest variation and
+re-expresses each cell as coordinates along them. In practice the first few
+dozen components capture the structure — the differences between cell types —
+while the remainder is largely technical noise.
+
+Each principal component is a weighted combination of genes, so a PC can often
+be read as a coordinated gene module (for example, a myeloid program).
+
+```{r}
+pbmc <- Seurat::RunPCA(pbmc,
+                       features = Seurat::VariableFeatures(object = pbmc),
+                       verbose = FALSE)
+```
+
+The object now reports a dimensional reduction alongside the assay:
+
+```{r}
+pbmc
+```
+
+# Clustering
+
+Clustering is where "cells" become "cell types". Seurat does this in two steps.
+
+`FindNeighbors()` builds a graph: each cell is connected to its nearest
+neighbors in PCA space, with edges weighted by how much their neighborhoods
+overlap. Note the `dims = 1:10` argument — we are using only the first 10 PCs,
+discarding the rest as noise.
+
+`FindClusters()` then partitions that graph, looking for groups of cells that
+are densely connected to each other and sparsely connected to everything else.
+The `resolution` parameter controls granularity: higher values yield more, finer
+clusters.
+
+```{r}
+pbmc <- Seurat::FindNeighbors(pbmc,
+                              dims = 1:10)
+pbmc <- Seurat::FindClusters(pbmc,
+                             resolution = 0.5)
+```
+
+The cluster assignment is written back into the metadata, under a name that
+records the resolution used. This matters: run several resolutions and you get
+several columns, and you can compare them.
+
+```{r}
+head(pbmc@meta.data)
+```
+
+# Visualization
+
+UMAP takes the same 10 PCs and finds a two-dimensional arrangement of cells that
+preserves local neighborhoods as well as it can. It is a *display* technique,
+not an analysis: clusters are computed in PCA space, and the UMAP just shows
+them to you.
+
+Read UMAPs with care. Which points sit next to which is meaningful; the distance
+between two well-separated blobs, the shape of a blob, and the orientation of
+the plot are not.
+
+```{r}
+pbmc <- Seurat::RunUMAP(pbmc,
+                        dims = 1:10)
+plot1 <- Seurat::DimPlot(pbmc,
+                reduction = "umap",
+                group.by = "RNA_snn_res.0.5")
+plot1
+```
+
+The finished object carries the full history of the analysis — the counts, the
+normalized and scaled data, the metadata, and both reductions:
+
+```{r}
+pbmc
+```
+
+# What we glossed over
+
+Every step above ran on a default, and each of those defaults is a decision
+someone made for a dataset that is not yours. The rest of the workshop is about
+turning them back into choices:
+
+- **Why 200 and 2,500 genes, and 5% mitochondrial?** Where these cutoffs come
+  from, why nuclei behave differently from cells, and how ambient RNA and
+  doublets produce the patterns we filtered on. Also: where the count matrix
+  itself comes from, since we started by reading one off disk — **Week 2**.
+- **Why log-normalize? Why 2,000 variable genes? Why 10 PCs and resolution
+  0.5?** Alternatives such as `SCTransform` (which replaces `NormalizeData`,
+  `FindVariableFeatures`, and `ScaleData` in one step), how to choose the
+  dimensionality, and how to tell a real cluster from an artifact of the
+  resolution knob — **Week 3**.
+- **How do I test anything, and what are these clusters?** Marker genes,
+  case/control comparisons within a cluster, and putting cell type names on the
+  numbered clusters we produced above — **Week 4**.
+- **What if the data came from several samples or batches?** Everything above
+  assumes one homogeneous dataset; with multiple samples the clusters can
+  separate by donor rather than by biology. Also bulk deconvolution, for
+  estimating cell type proportions when you only have bulk RNA-seq — **Week 5**.
+
+If you run this script on your own data today and the UMAP looks strange, that
+is the expected outcome, and it is the material for the next four weeks.
