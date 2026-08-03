@@ -1,0 +1,492 @@
+---
+title: "Week 2: Detecting doublets with scDblFinder"
+author: "Kevin Z. Lin"
+date: "2026-08-03"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This overview was made from the scDblFinder vignette,
+[https://plger.github.io/scDblFinder/articles/scDblFinder.html](https://plger.github.io/scDblFinder/articles/scDblFinder.html),
+and the accompanying paper (Germain *et al.*, F1000Research 2022).
+
+The SoupX tutorials dealt with mRNA that ended up in the wrong droplet. This one
+deals with a coarser problem: **two whole cells ending up in the same droplet.**
+
+Droplet protocols work by diluting cells enough that most droplets get either one
+cell or none. "Most" is doing a lot of work in that sentence. A droplet that
+captures two cells produces one barcode, one apparent transcriptome, and one row
+in your final matrix — a cell that does not exist, whose expression profile is the
+sum of two real ones. The rate is not negligible: it scales with how many cells
+you load, and 10–20% is common in experiments that push for high cell numbers.
+
+Some vocabulary, which the paper is careful about and which matters here:
+
+- A **droplet** is whatever got assigned to one barcode, singlet or not.
+- A **homotypic** doublet is two cells of the *same* type. It looks like a
+  slightly larger cell of that type. These are nearly impossible to detect from
+  expression alone — and mostly harmless, since they resemble what they are made
+  of.
+- A **heterotypic** doublet is two cells of *different* types. A T cell fused
+  with a monocyte looks like neither. These are the dangerous ones: they can
+  form their own cluster and be annotated as a novel intermediate cell type that
+  does not exist.
+
+**Every method in this space, including this one, targets heterotypic doublets.**
+That is the right priority, but you should know it is the deal being made: a
+clean doublet report does not mean there are no doublets, it means there are few
+detectable ones.
+
+## The idea
+
+We cannot see which droplets are doublets. But we can *manufacture* doublets we
+know about: take two real droplets, add their counts together, and you have a
+synthetic doublet with a known label.
+
+Do that thousands of times and you have a labelled training set. `scDblFinder`
+then builds a k-nearest-neighbour graph on the real droplets plus the artificial
+ones, and for each real droplet asks how much artificial-doublet company it keeps.
+Cells sitting in a neighbourhood dense with synthetic doublets are likely to be
+doublets themselves. Those neighbourhood statistics, along with library size and
+a few other features, are fed to a classifier.
+
+One refinement is worth knowing because it explains a design choice you would
+otherwise find odd. The classifier is trained to separate *artificial* doublets
+from *real droplets* — but some of those real droplets are themselves doublets,
+mislabelled as singlets, which actively misleads the training. So the procedure
+is iterated: droplets confidently called as doublets are removed from the
+training data and it is refit. Three rounds by default.
+
+# Setting up
+
+```{r install}
+# if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install("scDblFinder")
+```
+
+`scDblFinder` is a Bioconductor package rather than a CRAN one, so it installs
+through `BiocManager` instead of `install.packages()`.
+
+```{r libraries}
+library(Seurat)
+library(scDblFinder)
+library(ggplot2)
+```
+
+```{r clean_env}
+rm(list = ls())
+```
+
+# Getting the data
+
+We use the 10x **PBMC 1k** dataset — the same one as the first SoupX tutorial.
+Doublet detection itself needs only the called cells, but we also want
+CellRanger's clustering and UMAP coordinates so that we can *look* at the
+doublets at the end, so we download the `analysis/` folder too.
+
+```{r download}
+tmp_dir <- tempdir(check = TRUE)
+base_url <- paste0("https://cf.10xgenomics.com/samples/cell-vdj/4.0.0/",
+                   "sc5p_v2_hs_PBMC_1k/sc5p_v2_hs_PBMC_1k")
+
+for (component in c("filtered_feature_bc_matrix", "analysis")) {
+  destination <- file.path(tmp_dir, paste0(component, ".tar.gz"))
+  download.file(paste0(base_url, "_", component, ".tar.gz"),
+                destfile = destination)
+  untar(destination, exdir = tmp_dir)
+}
+```
+
+## Borrowing CellRanger's clusters and UMAP
+
+We are not going to *use* the clusters for doublet detection — more on that
+choice below — but we want them, and the UMAP coordinates, so that the final
+result can be plotted. Computing a UMAP ourselves is Week 3's material;
+CellRanger already did it, so we may as well read it off disk.
+
+Both files are CSVs whose first column is the cell barcode. `row.names = 1`
+tells `read.csv()` to use that first column as row names rather than as data,
+which is exactly the format Seurat wants for attaching metadata to cells.
+
+```{r read_metadata}
+clustering_df <- read.csv(file.path(tmp_dir, "analysis", "clustering",
+                                    "graphclust", "clusters.csv"),
+                          row.names = 1)
+umap_df <- read.csv(file.path(tmp_dir, "analysis", "umap",
+                              "2_components", "projection.csv"),
+                    row.names = 1)
+umap_df <- as.matrix(umap_df)
+
+head(clustering_df)
+head(umap_df)
+```
+
+Note the `as.matrix()`. Seurat stores dimension reductions as matrices, not data
+frames, and will reject a data frame.
+
+## Reading the counts
+
+```{r read_data}
+pbmc_data <- Seurat::Read10X(file.path(tmp_dir, "filtered_feature_bc_matrix"))
+class(pbmc_data)
+names(pbmc_data)
+```
+
+Here is a trap worth meeting deliberately. This dataset contains **two kinds of
+features** — 36,601 genes and 19 antibody-capture tags — so `Read10X()` does not
+return a matrix. It returns a *list* of two matrices, and prints a message saying
+so. Code written for a single matrix will fail here in confusing ways, or worse,
+silently analyze the wrong thing. We take the gene expression explicitly:
+
+```{r create_object}
+pbmc <- Seurat::CreateSeuratObject(counts = pbmc_data[["Gene Expression"]],
+                                   project = "pbmc1k",
+                                   meta.data = clustering_df)
+pbmc
+head(pbmc@meta.data)
+```
+
+Passing `meta.data = clustering_df` attaches the cluster labels at construction.
+Seurat matches on row names, so each cell gets its own label regardless of the
+row order in the CSV.
+
+Now the UMAP. A Seurat object keeps dimension reductions in a separate slot from
+metadata, so this needs its own step:
+
+```{r add_umap}
+pbmc[["umap"]] <- Seurat::CreateDimReducObject(umap_df,
+                                               key = "UMAP_",
+                                               assay = "RNA")
+pbmc
+```
+
+The `key` is the prefix Seurat gives the reduction's columns, and it must end in
+an underscore — it becomes the axis labels when you plot, so `UMAP_` yields
+`UMAP_1` and `UMAP_2`.
+
+# Handing the data to Bioconductor
+
+`scDblFinder` is a Bioconductor tool, and Bioconductor's container for
+single-cell data is the `SingleCellExperiment`, not Seurat's object. The two
+ecosystems hold the same information in different shapes, and moving between them
+is a routine chore you will do many times.
+
+```{r set_assay}
+Seurat::DefaultAssay(pbmc) <- "RNA"
+```
+
+Setting `DefaultAssay` first is a small piece of defensive hygiene. A Seurat
+object can hold several assays — raw RNA, SCTransform output, a SoupX-corrected
+matrix — and the conversion exports whichever is currently active. Being explicit
+means you know which matrix you just handed over.
+
+One extra step is needed on **Seurat version 5**, which introduced a new internal
+assay format (`Assay5`) that the converter does not fully understand. Rewrapping
+the counts in the older `Assay` format avoids the problem:
+
+```{r downgrade_assay}
+rna_counts <- Seurat::GetAssayData(pbmc[["RNA"]], layer = "counts")
+pbmc[["RNA"]] <- Seurat::CreateAssayObject(counts = rna_counts)
+```
+
+This prints `Assay RNA changing from Assay5 to Assay`, which is the operation
+succeeding, not a problem. If you are on Seurat 4 you can skip this chunk
+entirely. Checking `packageVersion("Seurat")` will tell you which you have.
+
+```{r to_sce}
+sce <- Seurat::as.SingleCellExperiment(pbmc)
+sce
+```
+
+Look at what came across: the counts, the `Cluster` column in `colData`, and the
+UMAP in `reducedDims`. The two ecosystems really do hold the same information in
+different shapes.
+
+`scDblFinder` works from the raw `counts` assay and does its own normalization
+and dimension reduction internally, so there is no need to normalize beforehand.
+You will notice the object also carries a `logcounts` assay — but since we never
+ran `NormalizeData()`, that is a copy of the raw counts rather than anything
+logged. Nothing downstream uses it here, but it is the kind of thing worth
+noticing rather than trusting by its name.
+
+# Running scDblFinder
+
+Artificial doublets are generated at random, so the result changes slightly from
+run to run. `set.seed()` fixes that.
+
+```{r run_scdblfinder}
+set.seed(10)
+sce_dbl <- scDblFinder::scDblFinder(sce, clusters = NULL)
+```
+
+`clusters = NULL` selects **random** artificial doublets: pairs of droplets are
+combined without regard to cell type.
+
+Note that we loaded CellRanger's clusters earlier and are now deliberately not
+using them. Having gone to the trouble, we could pass them —
+`scDblFinder(sce, clusters = sce$Cluster)` — which generates artificial doublets
+*between* clusters instead of at random.
+
+It would be reasonable to assume the cluster-aware version is simply better. It
+is not. The paper benchmarks both and finds them very close, and the package's
+own advice is to prefer the cluster-based approach only when your data segregates
+cleanly into clusters (or when you specifically want to know which cell types
+produced each doublet). When the structure is less crisp — which describes plenty
+of brain data — the random approach is the safer default. That is why it *is* the
+default, and it is what we use here. The clusters earn their keep in the
+visualization at the end instead.
+
+# Reading the output
+
+The function returns the same object with new columns in `colData`. Two matter.
+
+```{r scores}
+head(sce_dbl$scDblFinder.score)
+quantile(sce_dbl$scDblFinder.score)
+```
+
+`scDblFinder.score` runs from 0 to 1 and behaves like a probability of being a
+doublet — with the caveat, stated in the paper, that it is *not* calibrated to
+the underlying doublet rate, so do not read it as a literal posterior.
+
+```{r hist, fig.width=7, fig.height=5}
+hist(sce_dbl$scDblFinder.score,
+     breaks = 50,
+     main = "Doublet scores",
+     xlab = "scDblFinder score")
+```
+
+The shape to hope for is a large pile near zero with a thin tail reaching towards
+one: most droplets confidently singlets, a minority confidently not. A flat or
+broadly-spread histogram would be a warning sign — it would mean the classifier
+could not separate the two populations, and any threshold drawn through it would
+be arbitrary.
+
+`scDblFinder` also picks a threshold and gives you the call directly:
+
+```{r class_table}
+table(sce_dbl$scDblFinder.class)
+```
+
+## Where that threshold comes from
+
+This is the part most worth understanding, because it is where an unexamined
+default can quietly cost you a lot of cells.
+
+`scDblFinder` does not simply cut at a score of 0.5. It chooses a threshold that
+balances two objectives: misclassifying as few *artificial* doublets as possible,
+and landing near the number of doublets it *expects* the experiment to contain.
+
+That expectation comes from the `dbr.per1k` argument, default **0.008** — 0.8%
+doublets per thousand cells captured, which is the standard 10x figure. This
+dataset has 972 cells, so the expectation is only `0.972 * 0.008` ≈ **0.8%**,
+which is about 8 droplets. Compare that with the table above.
+
+That is a genuinely small number, and it is the honest consequence of a small
+capture rather than a shortcoming of the method. It also makes the scaling
+concrete: the same calculation on a 10,000-cell run would expect 8% doublets — a
+tenfold higher rate from the same chemistry, purely because more cells were
+loaded. If you are choosing how many cells to load, this is the trade-off you are
+making.
+
+Two consequences follow, and both bite in practice:
+
+- **The expected rate scales with cell count.** Load more cells, get proportionally
+  more doublets. This is a property of the chemistry, not of your biology.
+- **If your chemistry differs, change the argument.** 10x High Throughput chips
+  use roughly half this rate (`dbr.per1k = 0.004`). If you have an independent
+  estimate — from cell hashing or SNP demultiplexing — supply it directly with
+  `dbr`.
+
+> **Check your package version.** `scDblFinder` 1.20.0, which shipped with
+> Bioconductor 3.20, had this default set to `0.08` rather than `0.008` — a
+> tenfold overestimate of the doublet rate, and a large number of good cells
+> thrown away. It was corrected in 1.20.2. `packageVersion("scDblFinder")` will
+> tell you, and updating fixes it.
+
+> **The single most common failure.** If `scDblFinder` calls an implausible number
+> of doublets, the usual cause is a **multi-sample dataset run without the
+> `samples` argument**. Handed 40,000 cells from ten captures, it assumes one
+> enormous capture and infers a correspondingly enormous doublet rate. Doublets
+> form *within* a capture, so the calculation must be per capture:
+> `scDblFinder(sce, samples = "sample_id")`. This will apply to nearly everyone in
+> this workshop with more than one sample.
+
+# Back to Seurat, and filtering
+
+The scores live on the `SingleCellExperiment`. We copy them across to the Seurat
+object, which is where the rest of the analysis happens.
+
+```{r port_back}
+pbmc$scDblFinder.score <- sce_dbl$scDblFinder.score
+pbmc$scDblFinder.class <- sce_dbl$scDblFinder.class
+
+head(pbmc@meta.data)
+```
+
+This works because both objects have the same cells in the same order — the
+conversion preserved it. That is worth checking rather than assuming whenever you
+move data between containers:
+
+```{r check_order}
+all(colnames(pbmc) == colnames(sce_dbl))
+```
+
+# Looking at the doublets
+
+This is what the UMAP was for. Until now the doublets have been a number in a
+table; plotting them tells you whether that number is believable.
+
+```{r dimplot_class, fig.width=7, fig.height=5}
+Seurat::DimPlot(pbmc, group.by = "scDblFinder.class") +
+  ggplot2::ggtitle("Doublet calls")
+```
+
+The question to ask is *where* the flagged droplets sit. Two patterns are
+reassuring and one is not:
+
+- **Scattered at the edges of clusters, or in the gaps between them** — this is
+  what you hope for, and it is what the method predicts. A heterotypic doublet is
+  a mixture of two cell types, so it should land somewhere between the two
+  clusters it was made from.
+- **Concentrated in one small region** — worth investigating. It may be a genuine
+  doublet-heavy island, in which case you have just avoided annotating an
+  artifact as a novel cell type. That is the failure mode this whole exercise
+  exists to prevent.
+- **Spread uniformly across everything, including cluster cores** — a warning
+  sign. Doublets should not be indistinguishable from the cells around them, and
+  a diffuse pattern suggests the classifier found little real signal.
+
+It is also worth seeing the scores themselves rather than the thresholded call,
+because the threshold hides how marginal some decisions were:
+
+```{r featureplot_score, fig.width=7, fig.height=5}
+Seurat::FeaturePlot(pbmc, features = "scDblFinder.score") +
+  ggplot2::ggtitle("Doublet scores")
+```
+
+And against CellRanger's clusters, to see whether any one population is
+contributing more than its share:
+
+```{r dimplot_clusters, fig.width=7, fig.height=5}
+Seurat::DimPlot(pbmc, group.by = "Cluster", label = TRUE) +
+  ggplot2::ggtitle("CellRanger clusters")
+```
+
+# Filtering, and the result
+
+Now we drop the droplets called as doublets.
+
+```{r filter}
+pbmc <- subset(pbmc, scDblFinder.class == "singlet")
+pbmc
+```
+
+The UMAP coordinates were attached to the cells, so the reduction survives the
+subsetting — we can plot the retained singlets directly without recomputing
+anything.
+
+```{r dimplot_singlets, fig.width=7, fig.height=5}
+Seurat::DimPlot(pbmc, group.by = "Cluster", label = TRUE) +
+  ggplot2::ggtitle("Singlets only")
+```
+
+Compare this with the cluster plot above. On a dataset this clean the two will
+look nearly identical, because only a handful of droplets were removed — which is
+the correct outcome for a 972-cell capture, not a disappointing one.
+
+> **A caveat about reusing this UMAP.** These coordinates were computed by
+> CellRanger on *all* the droplets, doublets included. Removing cells from a
+> finished embedding is not the same as recomputing it: the doublets influenced
+> where the remaining cells were placed. For a quick look this is fine, and it is
+> the honest way to visualize a before-and-after. But the UMAP you put in a paper
+> should be computed *after* filtering — which is what you will do in Week 3.
+
+Two ordering questions come up immediately, and they have different answers.
+
+## Relative to quality-control filtering
+
+Here the package's advice is clear: **run doublet detection first, then filter on
+quality.** Two reasons, both worth internalizing:
+
+1. The expected doublet rate is computed from the number of cells you supply. If
+   you have already discarded a third of your cells as low quality, `scDblFinder`
+   is told the capture was smaller than it was and expects fewer doublets than
+   there really are.
+2. A doublet formed from one good cell and one dying cell may itself look
+   low-quality. Filter first and you remove it — which sounds fine, except you
+   have then removed it *as a bad cell* rather than identified it as a doublet,
+   and you have deprived the detector of an example.
+
+Two caveats. Empty droplets should already be gone before you start — this is
+what the *filtered* matrix is for. And extremely low-coverage cells (below a few
+hundred reads) should be removed, or the internal normalization can fail with a
+`size factors should be positive` error.
+
+## Relative to ambient RNA removal
+
+Here the honest answer is **nobody knows**, and the package authors say so
+outright. The arguments cut both ways:
+
+- A real doublet can look like contamination — it contains RNA from another cell
+  type, which is exactly what contamination looks like. So a decontamination tool
+  may try to "clean" a doublet, do it imperfectly, and leave behind something no
+  longer detectable as a doublet. That argues for **doublets first**.
+- But decontamination makes cells cleaner, which may make the doublet
+  classification problem easier. That argues for **SoupX first**.
+
+There is no published evidence favouring either order. This is not a gap in the
+tutorial — it is a gap in the field, and the useful response is to say what you
+did in your methods section rather than to imply a settled convention. If you
+have the time, running it both ways and checking whether your conclusions move is
+a legitimate robustness check.
+
+Note that this tutorial deliberately starts from raw counts rather than from the
+SoupX output, so that it stands alone. Chaining them is one line — the corrected
+matrix from `adjustCounts()` goes into `CreateSeuratObject()` in place of
+`pbmc_data[["Gene Expression"]]`.
+
+# What we glossed over
+
+- **Homotypic doublets are essentially invisible here.** Everything above is
+  about heterotypic ones. If you have hashing or SNP-based demultiplexing, those
+  methods catch both kinds and are complementary rather than redundant — expect
+  them to disagree with `scDblFinder`, and know why.
+- **We did not verify a single call.** We accepted `scDblFinder.class` without
+  checking whether the flagged droplets behave like doublets. A good check, once
+  you can cluster (Week 3): do the doublets concentrate in one region of the UMAP,
+  and does that region sit *between* two real clusters? A cluster that is
+  overwhelmingly doublets is one you should not be annotating.
+- **The default thresholding.** `dbr.sd` controls how much deviation from the
+  expected rate is tolerated; setting `dbr.sd = 1` lets classification accuracy
+  alone drive the threshold. We never touched it.
+- **`nfeatures`, `dims`, `iter`.** The number of genes, principal components and
+  training rounds were all defaults.
+- **Reproducibility across samples.** `set.seed()` is *not* sufficient when using
+  the `samples` argument, even without parallelism. The seed has to go to the
+  parallel backend: `BPPARAM = SerialParam(RNGseed = 10)`.
+- **Whether one method is enough.** The benchmark in the paper found that
+  combining `scDblFinder` with `DoubletFinder` improved results on most datasets,
+  though modestly. Averaging scores across methods is a reasonable thing to do if
+  doublets are central to your conclusions.
+
+# References
+
+- Germain PL, Lun A, Garcia Meixide C, Macnair W, Robinson MD. *Doublet
+  identification in single-cell sequencing data using scDblFinder.*
+  F1000Research 10:979, 2022.
+  [doi:10.12688/f1000research.73600.2](https://doi.org/10.12688/f1000research.73600.2)
+- Package vignette:
+  [plger.github.io/scDblFinder](https://plger.github.io/scDblFinder/articles/scDblFinder.html)

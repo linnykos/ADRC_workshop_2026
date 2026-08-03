@@ -1,0 +1,553 @@
+---
+title: "Week 2: Removing ambient RNA with SoupX (the manual route)"
+author: "Kevin Z. Lin"
+date: "2026-08-03"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This overview was made from [https://rawcdn.githack.com/constantAmateur/SoupX/204b602418df12e9fdb4b68775a8b486c6504fe4/inst/doc/pbmcTutorial.html](https://rawcdn.githack.com/constantAmateur/SoupX/204b602418df12e9fdb4b68775a8b486c6504fe4/inst/doc/pbmcTutorial.html).
+
+This is the second SoupX tutorial. The first one ran the whole procedure on
+autopilot: `load10X()` assembled everything, `autoEstCont()` produced a
+contamination fraction, `adjustCounts()` cleaned the counts, and we trusted all
+three. This document takes the same three steps apart and does the middle one by
+hand.
+
+There are two reasons to care, and both of them will apply to people in this
+room.
+
+**First, the autopilot depends on things your data may not have.** Everything
+convenient in the first tutorial came from CellRanger's `analysis/` folder being
+present and from `load10X()` finding it. If your experiment was not processed
+with CellRanger — a Parse run, a plate-based protocol, or a count matrix a
+collaborator emailed you — there is no `analysis/` folder, `load10X()` does not
+apply, and `autoEstCont()` refuses to run without clusters. You need to know how
+to assemble the object and attach the clustering yourself.
+
+**Second, the automatic estimate can be wrong, and you should be able to check
+it.** In the first tutorial the estimate came back at `rho = 0.01`, sitting
+exactly on the floor of the estimator's own search range. That was a defensible
+answer for a very clean dataset, but "the number landed on the boundary" is
+precisely the situation where you want a second, independent estimate. The manual
+route provides one.
+
+We also switch to a **dirtier dataset** on purpose. The PBMC 1k data from the
+first tutorial was about as clean as real data gets, which made the correction
+almost invisible. Here we use the 10x **PBMC 4k** dataset, the same one the SoupX
+authors use in their vignette. It comes out at **9.8% contamination** against the
+first tutorial's 1%, and the difference is dramatic: there, the most affected gene
+lost its counts in 14% of cells; here, ten genes lose theirs in half their cells
+or more. You will be able to see the correction do something.
+
+The plan:
+
+| Stage | What we do by hand | Functions |
+|---|---|---|
+| Build the object | Read the two matrices ourselves instead of letting `load10X()` do it | `Read10X`, `SoupChannel`, `estimateSoup` |
+| Attach the metadata | Read CellRanger's clusters and tSNE from CSV and set them explicitly | `setClusters`, `setDR` |
+| Choose estimation genes | Decide which genes are safe to measure contamination with | `quickMarkers`, `plotMarkerDistribution` |
+| Choose estimation cells | Decide which cells can be assumed not to express them | `estimateNonExpressingCells` |
+| Estimate and correct | Compute `rho` from those choices, then clean | `calculateContaminationFraction`, `adjustCounts` |
+
+This assumes you have been through the first tutorial. Concepts introduced there
+— the soup, `rho`, the soup profile, why the correction is done cluster-wise —
+are not re-explained here.
+
+# Setting up
+
+```{r libraries}
+library(SoupX)
+library(Matrix)
+library(ggplot2)
+```
+
+```{r clean_env}
+rm(list = ls())
+```
+
+# Getting the data
+
+We use the 10x **PBMC 4k** dataset: about 4,300 peripheral blood mononuclear
+cells from a healthy donor, processed with an older version of CellRanger.
+
+We download three archives. Two are the count matrices; the third is
+CellRanger's secondary analysis, which we will deliberately read by hand later.
+
+```{r download}
+tmp_dir <- tempdir(check = TRUE)
+base_url <- "https://cf.10xgenomics.com/samples/cell-exp/2.1.0/pbmc4k/pbmc4k"
+
+for (component in c("raw_gene_bc_matrices",
+                    "filtered_gene_bc_matrices",
+                    "analysis")) {
+  destination <- file.path(tmp_dir, paste0(component, ".tar.gz"))
+  download.file(paste0(base_url, "_", component, ".tar.gz"),
+                destfile = destination)
+  untar(destination, exdir = tmp_dir)
+}
+```
+
+Note the folder names: `raw_gene_bc_matrices` and `filtered_gene_bc_matrices`,
+not `raw_feature_bc_matrix` and `filtered_feature_bc_matrix` as in the first
+tutorial. This dataset was produced by CellRanger 2.1, before 10x renamed these
+outputs. Underneath each is a further folder named after the reference genome,
+`GRCh38`. Small differences like this are the normal texture of working with
+other people's data, and they are why hardcoding paths from a tutorial into your
+own analysis tends to fail.
+
+# Building the SoupChannel by hand
+
+In the first tutorial a single call to `load10X()` did everything. Here we do it
+in pieces, because seeing the pieces is the point.
+
+`Read10X()` turns a folder of 10x files into a sparse count matrix. We call it
+twice: once for the droplets that CellRanger called as cells (the **t**able **o**f
+**c**ounts, `toc`), and once for every droplet including the empty ones (the
+**t**able **o**f **d**roplets, `tod`).
+
+```{r read_matrices}
+toc <- Seurat::Read10X(file.path(tmp_dir, "filtered_gene_bc_matrices", "GRCh38"))
+tod <- Seurat::Read10X(file.path(tmp_dir, "raw_gene_bc_matrices", "GRCh38"))
+
+dim(toc)
+dim(tod)
+```
+
+The two matrices have the same 33,694 genes but wildly different numbers of
+columns: 4,340 cells in `toc` against **737,280** droplets in `tod`. That second
+number is the full 10x barcode whitelist — every barcode the chemistry could
+possibly have produced — so more than 99% of those droplets contain no cell at
+all. That enormous empty majority is exactly what makes the soup measurable.
+
+Now we assemble the object. `calcSoupProfile = FALSE` tells `SoupChannel()` not
+to profile the soup on construction, and then we do it in a separate, visible
+step. The two-step version is equivalent to the default, but it makes it obvious
+that profiling the soup is a real computation and not something that comes free
+with the object.
+
+```{r build_channel}
+sc <- SoupX::SoupChannel(tod, toc, calcSoupProfile = FALSE)
+sc <- SoupX::estimateSoup(sc)
+sc
+```
+
+`estimateSoup()` looks at droplets with fewer than 100 UMIs — its default
+`soupRange = c(0, 100)` — and computes each gene's share of the counts in them.
+That is step 1 of the method, now done explicitly.
+
+```{r soup_profile}
+head(sc$soupProfile[order(sc$soupProfile$est, decreasing = TRUE), ], n = 20)
+```
+
+`MALAT1` tops the list at about 3.3%, followed by `B2M`, `TMSB4X`, `EEF1A1` and
+then a long run of ribosomal protein genes. The `counts` column shows how much
+evidence sits behind each estimate — 88,000 `MALAT1` counts pooled across the
+empty droplets, so these are not fragile numbers.
+
+# Attaching clusters and dimension reduction after the fact
+
+This section is the heart of the tutorial.
+
+At this moment `sc` has counts and a soup profile, and **nothing else**. It has
+no clusters, so `autoEstCont()` would fail on it and `adjustCounts()` would fall
+back to a weaker cell-by-cell correction. We downloaded CellRanger's `analysis/`
+folder, but we never pointed `load10X()` at it, so nothing was picked up
+automatically. That is deliberate: we are going to attach the information
+ourselves, exactly as you would if it had come from a Seurat run, a collaborator,
+or any other outside source.
+
+CellRanger writes its clustering as a two-column CSV.
+
+```{r read_clusters}
+clustering_df <- read.csv(file.path(tmp_dir, "analysis", "clustering",
+                                    "graphclust", "clusters.csv"))
+head(clustering_df)
+table(clustering_df$Cluster)
+```
+
+`setClusters()` wants a vector of cluster labels **named by cell barcode**, not
+a data frame. `setNames()` builds exactly that: it takes the values as its first
+argument and the names as its second.
+
+```{r set_clusters}
+sc <- SoupX::setClusters(sc, setNames(clustering_df$Cluster,
+                                      clustering_df$Barcode))
+```
+
+> **The mistake to avoid.** It is tempting to write
+> `setNames(clustering_df$Cluster, rownames(clustering_df))`. After `read.csv()`,
+> the row names of a data frame are just `"1"`, `"2"`, `"3"`, … — the barcodes
+> live in the `Barcode` *column*, not in the row names. With row names, the
+> labels have no barcode to match against; SoupX falls back to assigning them
+> **by position**, which silently gives the right answer only if the CSV happens
+> to be in the same order as the count matrix. It is here, but relying on that is
+> how you get a plot that looks fine and is wrong. Name things by barcode and let
+> the matching be explicit.
+
+The same idea for the tSNE coordinates.
+
+```{r read_tsne}
+tsne_df <- read.csv(file.path(tmp_dir, "analysis", "tsne",
+                              "2_components", "projection.csv"))
+head(tsne_df)
+```
+
+Two small things to handle. The CSV's columns are named `TSNE-1` and `TSNE-2`,
+but `read.csv()` converts hyphens to dots, so in R they arrive as `TSNE.1` and
+`TSNE.2` — a good habit is to always `head()` a freshly read file rather than
+assume its column names. And `setDR()` matches on row names, so we move the
+barcodes there.
+
+```{r set_dr}
+rownames(tsne_df) <- tsne_df$Barcode
+sc <- SoupX::setDR(sc, tsne_df[colnames(sc$toc), c("TSNE.1", "TSNE.2")])
+
+head(sc$metaData)
+```
+
+Indexing with `tsne_df[colnames(sc$toc), ]` reorders the rows to match the count
+matrix's columns. Even when the file is already in the right order — as it is
+here — writing it this way means the code stays correct if it ever is not.
+
+# A first look at the data
+
+```{r plot_clusters, fig.width=7, fig.height=5}
+dd <- sc$metaData[colnames(sc$toc), ]
+dd$clusters <- as.factor(paste0("Cluster_", dd$clusters))
+
+mids <- aggregate(cbind(TSNE.1, TSNE.2) ~ clusters, data = dd, FUN = mean)
+
+gg <- ggplot2::ggplot(dd, ggplot2::aes(TSNE.1, TSNE.2)) +
+  ggplot2::geom_point(ggplot2::aes(colour = clusters), size = 0.2) +
+  ggplot2::geom_label(data = mids, ggplot2::aes(label = clusters)) +
+  ggplot2::ggtitle("PBMC 4k, CellRanger graph-based clusters") +
+  ggplot2::guides(colour = ggplot2::guide_legend(override.aes = list(size = 1)))
+plot(gg)
+```
+
+Note that the coordinate columns are still called `TSNE.1` and `TSNE.2` here.
+`setDR()` does not rename what you hand it — it copies your columns into
+`sc$metaData` under their existing names and records which ones they are in
+`sc$DR`. (The SoupX vignette calls them `RD1` and `RD2` only because its bundled
+metadata happened to arrive with those names.) The plotting functions later in
+this document read `sc$DR`, so they will find these coordinates whatever they are
+called.
+
+Note also that these clusters are **numbered, not named**. CellRanger does not
+know what a B cell is. Deciding which cluster is which cell type is Week 4's
+topic; for now the numbers are enough, because the contamination estimate needs
+to know only which cells group together, not what they are.
+
+# Choosing genes to estimate the contamination with
+
+Here is the whole idea in one sentence: **if we can find a gene that a cell
+definitely does not express, then every count of that gene in that cell must have
+come from the soup**, and comparing that count to the soup profile gives us
+`rho` for that cell.
+
+So we need genes that are confidently *off* in some identifiable set of cells.
+The difficulty is entirely in the word "confidently."
+
+## Why the most abundant soup genes are the wrong choice
+
+The obvious move is to use whatever is most abundant in the soup, since those
+give the strongest signal. Look again at the top of the soup profile above:
+`MALAT1`, `B2M`, `TMSB4X`, `EEF1A1`, and a dozen ribosomal protein genes. Those
+are the worst possible choices, because every cell expresses them. There is no
+set of cells for which we can say the true expression is zero, so any
+"contamination" we measure in them is mostly real biology.
+
+`RPL10` makes the point concretely: it sits ninth in the soup profile, at 0.81%
+of all background counts. Abundant — and useless for our purpose, because it is
+abundant *everywhere*. A marker map for it looks busy, but that signal is genuine
+ribosomal expression in every cluster, not contamination.
+
+```{r rpl10_map, fig.width=7, fig.height=5}
+gg <- SoupX::plotMarkerMap(sc, "RPL10")
+plot(gg)
+```
+
+The useful genes are the opposite kind: **highly expressed in one cell type and
+genuinely absent everywhere else**. `LYZ`, the monocyte marker from the first
+tutorial, is that sort of gene. So is `IGKC`, an antibody gene made only by B
+cells, and so is haemoglobin (`HBB`, `HBA2`) in tissue where red cells are the
+only source.
+
+## Letting the data suggest candidates
+
+`plotMarkerDistribution()` gives a survey. For each candidate gene it shows the
+distribution across cells of the ratio of observed counts to what pure soup would
+produce, with a red line marking the contamination fraction you would infer from
+that gene alone.
+
+```{r marker_distribution, fig.width=9, fig.height=5}
+SoupX::plotMarkerDistribution(sc)
+```
+
+> **Read this plot, do not automate it.** The SoupX authors are emphatic on this
+> point: it is a heuristic to develop your intuition, and if you simply take the
+> top N genes from it and estimate contamination with them, **you will
+> over-estimate**. That is why the function returns a plot and not a gene list.
+
+For a systematic candidate set we use `quickMarkers()`, which finds the genes
+most specific to each cluster. Specificity is scored by tf-idf, the same measure
+used to find words that characterize a document.
+
+```{r quick_markers}
+marker_genes <- SoupX::quickMarkers(sc$toc, sc$metaData$clusters)
+head(marker_genes[, c("gene", "cluster", "tfidf", "qval")])
+```
+
+The top hits for cluster 1 — `LEF1`, `CCR7`, `MAL`, `FLT3LG` — are naive T-cell
+genes, with q-values that leave no doubt. `quickMarkers()` has found real biology
+without being told any, which is the whole reason it is usable on a dataset you
+have never seen.
+
+We reshape the result into a list: one entry per cluster, containing that
+cluster's marker genes.
+
+```{r cluster_genes}
+cluster_genes <- split(marker_genes$gene, marker_genes$cluster)
+lengths(cluster_genes)
+```
+
+Ten genes per cluster, because `quickMarkers()` defaults to `N = 10` — it returns
+the top ten markers per cluster, not every gene that passes significance. Raising
+`N` gives more genes to estimate from but admits progressively less specific ones,
+which is a trade-off rather than a free improvement.
+
+Note that we split on `marker_genes$gene`, the **column** holding the gene names.
+`quickMarkers()` leaves the row names as `"1"`, `"2"`, `"3"`, … — the same trap as
+with the clusters CSV above, and it bites the same way: `split()` on row names
+returns lists of row numbers, and SoupX would then look for genes literally named
+`"1"` and find nothing.
+
+The reason `nonExpressedGeneList` is a *list* of gene sets rather than one flat
+vector is that genes are grouped by biology. Immunoglobulin genes rise and fall
+together; haemoglobin genes rise and fall together. SoupX uses or excludes each
+group as a unit.
+
+# Choosing which cells to estimate from
+
+Having picked gene sets, we now need, for each set, the cells that can be assumed
+not to express it. A B-cell marker tells us nothing about contamination *in B
+cells* — there the expression is real.
+
+```{r estimate_non_expressing}
+useToEst <- SoupX::estimateNonExpressingCells(sc, nonExpressedGeneList = cluster_genes)
+dim(useToEst)
+```
+
+The result is 4,340 × 8 — one row per cell, one column per gene set — holding
+TRUE/FALSE: may this cell be used to estimate contamination with this gene set?
+
+SoupX is deliberately conservative here. Because we supplied clusters, it works
+at cluster level: if *any* cell in a cluster shows convincing evidence of
+expressing a gene set, the entire cluster is excluded for that set. Excluding
+real expressers matters much more than losing some cells, since a cell that
+genuinely expresses the gene would inflate `rho` and cause over-correction.
+
+We can look at the decision for a couple of gene sets. Cells outlined in green
+are the ones being used for estimation; the fill colour is the observed-to-soup
+ratio.
+
+```{r plot_use_to_est, fig.width=7, fig.height=5}
+SoupX::plotMarkerMap(sc, geneSet = cluster_genes[[1]], useToEst = useToEst[, 1])
+SoupX::plotMarkerMap(sc, geneSet = cluster_genes[[5]], useToEst = useToEst[, 5])
+```
+
+The first set is cluster 1's markers — the naive T-cell genes `LEF1`, `CCR7`,
+`MAL` and company from the table above. In each map, the cluster the markers came
+from should be the region that is *excluded*: reddish, because expression there
+is genuine and far above soup level, and not outlined, because those cells are
+useless for measuring contamination. Everything else is available for estimation.
+This is the step the automatic method performs invisibly, and it is where a
+mistake would do the most damage.
+
+# Calculating the contamination fraction
+
+All the judgement has now been made. The arithmetic is one call.
+
+```{r calc_contamination, message=TRUE}
+sc <- SoupX::calculateContaminationFraction(sc, cluster_genes, useToEst = useToEst)
+head(sc$metaData)
+```
+
+**9.78%** — nearly ten times the `rho = 0.01` of the first tutorial. Roughly one
+count in ten in this dataset came from the soup rather than from the cell it was
+assigned to. Now the correction has something substantial to do.
+
+Unlike `autoEstCont()`, this function also records `rhoLow` and `rhoHigh`, a
+confidence interval on the estimate. Here it runs from 0.0953 to 0.1004 — a
+spread of half a percentage point, which is tight. That tells us the gene sets
+carried plenty of information and the estimate is well determined. A wide
+interval, or one running down towards 0, would be a signal to revisit the gene
+and cell choices above rather than to accept the number.
+
+> **A number that does not match the vignette, and why.** The SoupX vignette gets
+> 7.69% on this same dataset; we get 9.78%. The difference is the gene sets. The
+> vignette estimates from immunoglobulin genes only — a set its authors were
+> confident about on biological grounds — whereas we used the top markers of all
+> eight clusters. More gene sets means more cells contributing, but also admits
+> genes whose "non-expression" is less certain, which pushes the estimate up.
+> Neither number is the true value; both are estimates from different, defensible
+> choices. This is worth sitting with, because it is the honest situation you are
+> in with your own data: the contamination fraction is not read off the data, it
+> is *inferred from assumptions you make*, and reasonable assumptions differ by a
+> couple of percentage points. Recall from the first tutorial that SoupX is
+> forgiving of exactly this kind of error.
+
+## How this compares to the automatic route
+
+It is worth being clear about what actually differed. `autoEstCont()` performs
+these same steps: it calls `quickMarkers()`, applies `estimateNonExpressingCells()`,
+and computes `rho` from many gene–cluster pairs. The differences are that it
+filters the marker list more aggressively (by tf-idf and by abundance in the
+soup), it combines the many per-gene estimates by taking the mode of their
+posterior rather than a single pooled calculation, and it constrains the answer
+to `contaminationRange`.
+
+So this is not a different method so much as the same method with the decisions
+exposed. The value of doing it by hand is that you can substitute your own
+biology at the point where it matters. If you know your tissue contains red blood
+cells, `list(HB = c("HBB", "HBA2"))` is a better gene set than anything
+`quickMarkers()` will find for you.
+
+# Correcting the counts
+
+```{r adjust}
+out <- SoupX::adjustCounts(sc)
+```
+
+# What actually changed
+
+As before, the fraction of expressing cells driven to zero for each gene:
+
+```{r most_zeroed}
+cnt_soggy <- Matrix::rowSums(sc$toc > 0)
+cnt_strained <- Matrix::rowSums(out > 0)
+most_zeroed <- tail(sort((cnt_soggy - cnt_strained) / cnt_soggy), n = 10)
+most_zeroed
+```
+
+Compare with the first tutorial, where the largest value was 0.14. Here the list
+runs from 0.46 to **0.63**: for `S100A9`, 63% of the cells that had a non-zero
+count now have none. Nearly ten times the soup produced a categorically different
+correction, not merely a larger one.
+
+The genes themselves are the story. Every one is a high-expression marker of a
+single population:
+
+- `S100A9`, `S100A8`, `LYZ`, `CST3` — monocytes and myeloid cells.
+- `IGLC2`, `IGKC`, `IGLC3` — immunoglobulin, made only by B cells.
+- `GNLY`, `NKG7` — cytotoxic granule genes from NK and effector T cells.
+- `PPBP` — platelets.
+
+This is the same pattern as the first tutorial, where the equivalent list was led
+by platelet and myeloid genes, but far more pronounced. Note that `LYZ` (0.577)
+and `IGKC` (0.575) — the two genes we look at directly below — are themselves in
+this top ten, out of all 33,694 genes. They are not incidental examples; they are
+among the genes the correction touches most.
+
+And the genes that changed quantitatively:
+
+```{r quantitative_change}
+tail(sort(Matrix::rowSums(sc$toc > out) / Matrix::rowSums(sc$toc > 0)), n = 20)
+```
+
+The mitochondrial genes dominate, as they did in the first tutorial: `MT-ND1`
+through `MT-CYB`, every one at a ratio of 1, meaning every cell expressing them
+lost counts. Mitochondrial transcripts are over-represented in the background
+relative to cells, so this is the expected result and it carries the same warning
+as before — **ambient RNA inflates the mitochondrial fraction you filter on
+during quality control**, so some cells that look low-quality are simply soupy.
+
+The same caveat as the first tutorial also applies to the rest of the list.
+`BX004987.4`, `AC011043.1`, `AL592183.1` and the other accession-numbered loci
+are detected in very few cells, so the denominator of the ratio is tiny and
+reaching exactly 1.0 takes almost nothing. Check the denominator before reading
+meaning into the top of a sorted ratio.
+
+## The correction, seen directly
+
+```{r change_map_lyz, fig.width=7, fig.height=5}
+SoupX::plotChangeMap(sc, out, "LYZ")
+```
+
+```{r change_map_igkc, fig.width=7, fig.height=5}
+SoupX::plotChangeMap(sc, out, "IGKC")
+```
+
+`LYZ` should lose its scatter outside the monocyte cluster and `IGKC` outside the
+B cells, while both keep their counts where the expression is real. We know from
+the table above that this is a large effect — each gene lost its counts entirely
+in about 57% of the cells that had any — so on this dirtier dataset the change
+should be far more visible than the near-invisible correction in the first
+tutorial.
+
+Contrast that with a ubiquitously expressed gene:
+
+```{r change_map_rpl10, fig.width=7, fig.height=5}
+SoupX::plotChangeMap(sc, out, "RPL10")
+```
+
+`RPL10` is abundant in the soup, so counts are removed from it too — but they are
+removed roughly evenly everywhere, because every cell genuinely expresses it.
+Nothing about the interpretation of `RPL10` changes. This is the visual version
+of the earlier point: correction reshapes the genes whose expression is
+concentrated in one cell type, and merely rescales the ones that are not.
+
+# Using the cleaned matrix downstream
+
+```{r seurat, eval=FALSE}
+pbmc <- Seurat::CreateSeuratObject(counts = out)
+```
+
+# What we glossed over
+
+- **We still took CellRanger's clusters as given.** We attached them by hand
+  rather than having them attached for us, but we did not produce or evaluate
+  them. Clustering is Week 3. The good news is that SoupX is not very sensitive
+  to the clustering used — Seurat defaults give similar results — because the
+  clusters only need to group cells well enough to tell which ones express a
+  gene set.
+- **The gene sets came from the data, not from biology.** We used
+  `quickMarkers()` because it generalizes to a dataset you know nothing about.
+  When you *do* know the biology, naming the genes yourself is better — and as
+  the 9.78%-versus-7.69% discrepancy above shows, the choice moves the answer by
+  a couple of percentage points. For a tissue with red cell contamination, for
+  example: `list(HB = c("HBB", "HBA2"), IG = c("IGKC", "IGHG1", "IGHM"))`.
+- **We never cross-checked with `autoEstCont()`.** This dataset has clusters
+  attached now, so the automatic estimator would run on it. Comparing the two
+  numbers costs one line and is a genuinely good habit.
+- **We accepted the default FDR thresholds** in `estimateNonExpressingCells()`,
+  which control how much evidence of expression is needed to exclude a cluster.
+- **`rho` is still one number for the whole channel.** Both routes assume a
+  constant contamination fraction across cells within a channel.
+- **We did not verify that the correction helped.** The honest test is downstream:
+  cluster the corrected and uncorrected matrices and see whether marker genes
+  become more cell-type specific. That is a Week 3 exercise, and a good one.
+
+# References
+
+- Young MD, Behjati S. *SoupX removes ambient RNA contamination from droplet-based
+  single-cell RNA sequencing data.* GigaScience 9(12), 2020.
+  [doi:10.1093/gigascience/giaa151](https://doi.org/10.1093/gigascience/giaa151)
+- PBMC 4k dataset (10x Genomics, CellRanger 2.1.0). The files used above are
+  downloaded directly from
+  `https://cf.10xgenomics.com/samples/cell-exp/2.1.0/pbmc4k/`; the dataset's
+  documentation page is
+  [support.10xgenomics.com/single-cell-gene-expression/datasets/2.1.0/pbmc4k](https://support.10xgenomics.com/single-cell-gene-expression/datasets/2.1.0/pbmc4k).
