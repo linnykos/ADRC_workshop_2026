@@ -324,7 +324,7 @@ Two consequences follow, and both bite in practice:
 > `scDblFinder(sce, samples = "sample_id")`. This will apply to nearly everyone in
 > this workshop with more than one sample.
 
-# Back to Seurat, and filtering
+# Back to Seurat
 
 The scores live on the `SingleCellExperiment`. We copy them across to the Seurat
 object, which is where the rest of the analysis happens.
