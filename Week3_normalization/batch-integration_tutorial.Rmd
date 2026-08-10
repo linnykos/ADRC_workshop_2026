@@ -1,0 +1,667 @@
+---
+title: "Week 3: Batch effects and integration in Seurat v5"
+author: "Kevin Z. Lin"
+date: "2026-08-09"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This tutorial was made from the Seurat v5 vignette *Integrative analysis in
+Seurat v5*,
+[https://satijalab.org/seurat/articles/seurat5_integration](https://satijalab.org/seurat/articles/seurat5_integration),
+and the Azimuth mapping tutorial,
+[https://satijalab.github.io/azimuth/articles/run_azimuth_tutorial.html](https://satijalab.github.io/azimuth/articles/run_azimuth_tutorial.html).
+
+Week 1 ran the whole pipeline on a single sample and pretended that was the
+normal case. It is not. Almost nobody has one sample. You have four donors, or
+two 10x runs done three weeks apart, or a pilot on one chemistry and the rest on
+another. And the moment you have more than one, a new failure mode appears: **the
+cells group by where they came from rather than by what they are.**
+
+That is a batch effect, and it is not subtle. Run the Week 1 pipeline unchanged
+on a multi-sample dataset and you will often get one group per sample per cell
+type — a UMAP that looks like a technical inventory of your experiment rather
+than a picture of your biology.
+
+The fix is called **integration**, and the single most important thing to
+understand about it is what it does *not* do:
+
+> **Integration does not change your counts.** It produces a new
+> low-dimensional embedding — a replacement for the PCA — in which cells of the
+> same type from different batches sit on top of each other. Everything that
+> consumes a reduction — UMAP, clustering, neighbour graphs — can then use it.
+> But when you later test genes for differential expression, you go back to the
+> original counts. Nothing in this tutorial edits a single count.
+
+The plan:
+
+| Stage | What it produces | Function |
+|---|---|---|
+| 0. Label the cells against a reference | A cell type per cell, fixed before any integration happens | `RunAzimuth()` |
+| 1. Declare the batches | One layer per batch inside the RNA assay | `split()` |
+| 2. Run the Week 1 pipeline | Normalized data, variable genes, a PCA | `NormalizeData()` … `RunPCA()` |
+| 3. Look at the damage | A UMAP in which cells group by technology | `RunUMAP()`, `DimPlot()` |
+| 4. Integrate | A new reduction, `integrated.cca`, in which they do not | `IntegrateLayers()` |
+| 5. Look again | The same cells, the same genes, batches mixed | `RunUMAP()`, `DimPlot()` |
+| 6. Put the layers back together | One `counts` and one `data` layer, ready for testing | `JoinLayers()` |
+
+Stage 0 is there for a specific reason. To judge whether integration worked, you
+need a read on each cell's identity that does not itself depend on the
+integration. Anything computed *from* the integrated embedding — clusters above
+all — is circular evidence that it succeeded. Azimuth gives us an independent
+label per cell, assigned against an external reference, before any of the
+integration happens, and we never update it afterwards.
+
+That is also why this tutorial never clusters. Integration produces a reduction;
+whether it worked is a question about that reduction, and two fixed labels —
+which batch a cell came from and which cell type it is — answer it without
+introducing a clustering algorithm and its resolution parameter as a confound.
+
+> **Where this sits in the workshop.** The middle of this tutorial — normalize,
+> pick variable genes, scale, PCA — is exactly the Week 3 material, run
+> here on a dataset whose batch structure is impossible to ignore. The companion
+> Week 3 tutorial takes the normalization step on its own and replaces this
+> log-normalize / variable-genes / scale sequence with `SCTransform`. Batch
+> correction runs across two sessions: this is part one, and **Week 4** returns
+> to it — comparing integration methods and testing genes once the batches are
+> aligned. Bulk deconvolution is **Week 5**.
+
+# Setting up
+
+`Seurat` is on CRAN. `SeuratData` (which distributes the demonstration datasets)
+and `Azimuth` (which does the reference mapping) are not, so they install from
+GitHub with `devtools`. You only need to do this once, which is why the lines are
+commented out.
+
+```{r install}
+# install.packages("devtools")
+# devtools::install_github("satijalab/seurat-data")
+# devtools::install_github("satijalab/azimuth")
+```
+
+```{r libraries}
+library(Seurat)
+library(SeuratData)
+library(SeuratObject)
+library(Azimuth)
+library(patchwork)
+library(ggplot2)
+```
+
+```{r clean_env}
+rm(list = ls())
+```
+
+Integration ships pieces of your data to parallel workers, and Seurat's default
+size limit for doing so is smaller than this dataset. Raising it up front avoids
+an error two hundred lines from now that says nothing about batches:
+
+```{r future_globals}
+options(future.globals.maxSize = 1e10)
+```
+
+> **If `RunAzimuth()` fails with a `stringi` error.** A `lazy-load database
+> '.../stringi/R/stringi.rdb' is corrupt` message has nothing to do with your
+> data or with Azimuth. It means the `stringi` package was updated underneath a
+> running R session. Restart R and run the script again.
+
+# The data
+
+We use **pbmcsca**, the dataset from Ding *et al.* (2020), who took peripheral
+blood mononuclear cells from two donors and profiled them with seven different
+single-cell technologies. It is a deliberately extreme case: the technologies
+differ in chemistry, in capture efficiency, in read depth, and in whether they
+count molecules or reads at all.
+
+That extremity is the point. Your own batch effect will be milder than this one,
+but it will be the same *kind* of thing, and a mild version of a visible problem
+is easier to learn from than a mild version of an invisible one.
+
+```{r install_data}
+# SeuratData::InstallData("pbmcsca")
+```
+
+```{r load_data}
+obj <- SeuratData::LoadData("pbmcsca")
+obj
+```
+
+```{r methods_table}
+table(obj$Method)
+```
+
+Nine batches, not seven: 10x Chromium v2 was run three separate times, and those
+runs are correctly treated as separate batches even though the chemistry is
+identical. **A batch is a unit of technical variation, not a brand name.**
+
+The metadata also carries the authors' own cell type calls, which we will use
+later as a second opinion:
+
+```{r metadata_head}
+head(obj@meta.data)
+```
+
+## A filter that is itself a batch effect
+
+The vignette opens by dropping cells with fewer than 1,000 detected genes. This
+looks like the routine quality filter from Week 1, and it is worth pausing on
+because it is not routine at all here.
+
+```{r subset}
+obj <- subset(obj, subset = nFeature_RNA > 1000)
+obj
+```
+
+```{r methods_table_after}
+table(obj$Method)
+```
+
+Compare that with the table before the filter. Smart-seq2 kept 512 of its 526
+cells; inDrops kept 545 of 6,584. **One global threshold retained 97% of one
+technology and 8% of another** — not because inDrops captured worse cells, but
+because a plate-based full-length protocol and a high-throughput droplet protocol
+detect genes at completely different rates.
+
+> **The general lesson, which matters more than this dataset.** A single QC
+> cutoff applied across batches silently reweights your experiment. If your
+> batches differ in depth — different chemistries, different sequencing runs,
+> fresh versus frozen — a global `nFeature_RNA` floor removes cells
+> disproportionately from the shallow batches, and you will never see it in the
+> filtered object. Tabulate your QC threshold against your batch variable before
+> you trust it.
+
+The filter takes 31,021 cells down to 10,434. We are keeping it, because it is
+what the vignette does and because the surviving cells still show the batch
+effect clearly — but it is a choice, not a default.
+
+## The batch effect, visible in five numbers
+
+Before any modelling, look at the raw matrix.
+
+```{r layer_data}
+count_mat <- SeuratObject::LayerData(obj, assay = "RNA", layer = "counts")
+dim(count_mat)
+count_mat[1:5, 1:5]
+```
+
+Those five columns are Smart-seq2 cells, and `DPM1` has a count of 366 in the
+first one. A housekeeping gene in a 10x cell would show a count in the single
+digits. Nothing is wrong: Smart-seq2 counts *reads*, while the droplet methods
+count *unique molecules*, so the two are on scales that are not comparable at
+all. Per batch:
+
+```{r depth_by_method}
+tapply(obj$nCount_RNA, obj$Method, median)
+```
+
+A median library of 331,917.5 for Smart-seq2 against 3,098 for 10x Chromium v2 —
+a factor of **107** between two sets of cells in the same object. (The `.5`
+endings are just medians over an even number of cells.)
+
+That is the batch effect. It is sitting in the count matrix before you do
+anything, and no amount of log-normalization makes two protocols that measure
+different quantities comparable. Notice also that the other eight batches span
+only 2,572 to 6,083, so the spread here is really "Smart-seq2 versus everything
+else" — a reminder that batches are rarely equally different from one another,
+and that one outlying batch can dominate what integration ends up correcting.
+
+# Labelling the cells with Azimuth
+
+`RunAzimuth()` maps our cells onto an annotated reference and copies the
+reference's labels across. The reference here is `pbmcref`, the Satija lab's
+multimodal PBMC atlas. Under the hood it normalizes our query with the
+reference's own SCTransform model, finds **transfer anchors** — pairs of cells,
+one in the query and one in the reference, that look like mutual nearest
+neighbours — and uses those anchors to carry labels over.
+
+```{r run_azimuth}
+obj <- Azimuth::RunAzimuth(obj, reference = "pbmcref")
+obj
+```
+
+The object grew from one assay to four. The three new ones are named
+`prediction.score.celltype.l1`, `.l2` and `.l3`, and they are the first surprise:
+
+> **The `prediction.score.*` assays do not contain expression.** An "assay" in
+> Seurat is just a features-by-cells matrix, and Azimuth reuses that container to
+> store, for each cell, the probability assigned to *every* candidate cell type.
+> The rows are cell types, not genes. Running `FindVariableFeatures()` or a
+> differential expression test on one of these by accident is a real hazard —
+> check `DefaultAssay(obj)` before any command that does not name its assay.
+
+The reference is annotated at three levels of resolution, so we get three sets of
+labels — from eight broad classes at level 1 down to fine subtypes at level 3:
+
+```{r azimuth_labels}
+table(obj$predicted.celltype.l1)
+length(unique(obj$predicted.celltype.l2))
+```
+
+Two reductions also appeared, `integrated_dr` and `ref.umap`. Those are the
+query cells projected into the *reference's* coordinate system. They are useful,
+but they are not what we integrate on — we build our own embedding below.
+
+## Reading the confidence, not just the label
+
+Every cell got a label. That is not a compliment to the data; Azimuth has no
+"unknown" category, so the nearest reference cell type always wins, however far
+away it is. Two columns tell you how much to believe it:
+
+```{r azimuth_scores}
+quantile(obj$predicted.celltype.l2.score)
+quantile(obj$mapping.score)
+```
+
+The **prediction score** is how strongly the anchors agreed on this particular
+label; the **mapping score** is a different question — whether the cell's local
+neighbourhood is represented in the reference at all. A cell can score highly on
+the first and poorly on the second, and that combination is the interesting one:
+confidently assigned to a type that does not really describe it.
+
+The median prediction score is 0.918, which is high, but the minimum is 0.219.
+Those low-scoring cells still carry a definite-looking string in
+`predicted.celltype.l2`, and nothing downstream will remind you that it was a
+coin flip.
+
+## A second opinion
+
+This dataset is unusual in shipping the original authors' own annotations, so we
+can compare two independent labelings of the same cells:
+
+```{r label_agreement}
+table(obj$predicted.celltype.l1, obj$CellType)
+```
+
+Read the diagonal blocks first: 1,489 of the 1,525 published B cells are called
+`B`, and 1,493 of 1,557 CD14+ monocytes are called `Mono`. The coarse structure
+is not in dispute.
+
+Now read off the diagonal, where it gets honest. The published "Cytotoxic T
+cell" class splits across `CD8 T` (1,846), `other T` (569), `CD4 T` (201) and
+`NK` (167). Neither labeling is wrong — they were made against different
+references with different granularity, and the CD8/NK/γδ boundary is genuinely
+where T cell annotation is hardest.
+
+> **The transferable point for your own data.** Cell type labels are estimates
+> with error bars, not facts read off the cells. Two competent analyses of the
+> same PBMCs — the easiest, most heavily annotated tissue there is — place about
+> a third of the T cells in different classes. If a conclusion in your paper
+> depends on a boundary between two adjacent labels, that boundary needs
+> defending.
+
+> **`pbmcref` is a PBMC reference.** Everyone in this room is working on brain,
+> and mapping nuclei onto a blood atlas will produce confident, meaningless
+> labels. Azimuth ships human motor cortex among its references, and MapMyCells
+> covers the Allen brain taxonomies — that is Week 4's material. What generalizes
+> from this section is the *procedure*, not the reference.
+
+# Declaring the batches
+
+Here is the idea that organizes all of Seurat v5. In v4, nine batches meant nine
+Seurat objects that you merged and tracked by hand. In v5 there is one object,
+and the assay inside it holds **layers** — one `counts` and one `data` layer per
+batch.
+
+```{r split_layers}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Method)
+obj
+```
+
+Eighteen layers now: nine `counts` and nine `data`, named after the values of
+`Method`. The cells did not move and nothing was copied apart from the split
+itself.
+
+> **`f =` is the most consequential argument in this tutorial.** It defines what
+> you are calling a batch, and therefore what integration will treat as noise to
+> be removed. Split by 10x run and you remove run-to-run variation. Split by
+> donor and you remove donor-to-donor variation — including, if you are not
+> careful, the difference between your cases and your controls. More on this
+> below; it is the one part of this tutorial that can invalidate a paper.
+
+# The Week 1 pipeline, unchanged
+
+Nothing here is new except what the layers do to it.
+
+```{r normalize}
+obj <- Seurat::NormalizeData(obj)
+obj <- Seurat::FindVariableFeatures(obj)
+obj <- Seurat::ScaleData(obj)
+```
+
+Because the assay is split, `NormalizeData()` and `FindVariableFeatures()` run
+**once per layer** rather than once overall. That matters: variable genes chosen
+across the pooled data would be dominated by genes that differ between
+technologies, which are exactly the genes you do not want driving the structure.
+Seurat picks the variable genes per batch and then takes a consensus set.
+
+```{r variable_features}
+length(Seurat::VariableFeatures(obj))
+head(Seurat::VariableFeatures(obj), 20)
+```
+
+Two thousand genes, led by `LYZ`, `S100A9`, `CD74` and the MHC class II genes —
+a sensible list of things that differ between monocytes, B cells and T cells.
+
+```{r pca}
+set.seed(10)
+obj <- Seurat::RunPCA(obj, verbose = FALSE, seed.use = 10)
+```
+
+`RunPCA()` draws random starting vectors, so it gets a seed. Seurat's own
+`seed.use` argument is set as well as the ambient stream, because several Seurat
+functions call `set.seed()` internally just before their solver — setting only
+the outer seed looks reproducible without being reproducible.
+
+```{r umap_unintegrated}
+set.seed(10)
+obj <- Seurat::RunUMAP(obj,
+                       dims = 1:30,
+                       reduction = "pca",
+                       reduction.name = "umap.unintegrated",
+                       seed.use = 10)
+```
+
+`reduction.name` matters here: the default would be `umap`, and the second UMAP
+we build after integration would silently replace this one. We want both, to
+compare.
+
+# Looking at the damage
+
+```{r dimplot_unintegrated_method, fig.width=8, fig.height=5}
+Seurat::DimPlot(obj, reduction = "umap.unintegrated", group.by = "Method")
+```
+
+```{r dimplot_unintegrated_celltype, fig.width=9, fig.height=5}
+Seurat::DimPlot(obj, reduction = "umap.unintegrated",
+                group.by = "predicted.celltype.l2")
+```
+
+Hold these two panels side by side. In the first, the islands are almost
+uniformly single-coloured: Drop-seq occupies its own territory, Smart-seq2 and
+Seq-Well theirs, and only the three 10x runs partially overlap each other. In the
+second, the cell type labels *do* look coherent within each island — but the same
+label keeps reappearing in islands far apart. `CD14 Mono` shows up as several
+separate blobs on the right, `B naive` as three or four along the top.
+
+That is the signature of an unintegrated multi-batch dataset: not one island per
+cell type, but one island per cell type **per batch**.
+
+Before integrating, there is one prerequisite worth checking. Anchor-based
+methods assume the batches contain **the same cell types** — that is what makes
+"this cell in batch A matches that cell in batch B" a meaningful statement. The
+Azimuth labels let us check that directly, without any clustering:
+
+```{r celltype_by_method}
+table(obj$predicted.celltype.l1, obj$Method)
+```
+
+No cell type is missing from any batch, which is the condition integration needs.
+But look at how unevenly they are represented: **inDrops is 90% monocytes, while
+Drop-seq is 3%**. Seq-Well is 54% monocytes; CEL-Seq2 and Smart-seq2 are more
+than half T cells.
+
+That is a second kind of batch effect, and integration does not fix it. Aligning
+the batches makes a monocyte from one protocol land on a monocyte from another;
+it does not change the fact that one protocol captured 490 monocytes and another
+captured 58. Any comparison of cell type *proportions* across these batches is
+measuring capture chemistry, not biology.
+
+> **If a batch genuinely lacks a cell type, integration will invent one.** The
+> method's job is to align populations across batches; handed a batch with no
+> monocytes, it will still find the "best" match for the other batches'
+> monocytes and pull something onto them. Check this table before you integrate,
+> not after you have a UMAP you like.
+
+# Integrating
+
+`IntegrateLayers()` takes the per-batch layers and the unintegrated PCA, and
+returns a new reduction in which the batches are aligned.
+
+```{r integrate}
+obj <- Seurat::IntegrateLayers(object = obj,
+                               method = Seurat::CCAIntegration,
+                               orig.reduction = "pca",
+                               new.reduction = "integrated.cca",
+                               verbose = FALSE)
+obj
+```
+
+This takes a couple of minutes on a laptop — the slowest step in the tutorial.
+
+`CCAIntegration` is Seurat's anchor-based method. Canonical correlation analysis
+finds directions of variation that are *shared* between two datasets rather than
+maximal within either one; cells that are mutual nearest neighbours in that
+shared space become **anchors**, and the anchors define the correction applied to
+everything else. The intuition worth keeping is that anchors are the method's
+guess at "this cell in batch A and this cell in batch B are the same kind of
+cell", and everything the method does downstream is only as good as that guess.
+
+Four other methods are available through the same one-line interface, and
+switching between them is a change of one argument:
+
+| `method =` | What it is |
+|---|---|
+| `CCAIntegration` | Anchor-based CCA. Strong correction; what we use here |
+| `RPCAIntegration` | Anchor-based, reciprocal PCA. Faster and more conservative |
+| `HarmonyIntegration` | Iterative clustering and correction in PCA space |
+| `FastMNNIntegration` | Mutual nearest neighbours |
+| `scVIIntegration` | Variational autoencoder; needs Python and `scvi-tools` |
+
+Which to use is a real question with no universal answer, and it is Week 4's
+material. The relevant fact for today is that trying a second one costs one line,
+so "we used CCA because it was in the tutorial" is not a defensible methods
+section when the alternative was that cheap.
+
+```{r umap_integrated}
+set.seed(10)
+obj <- Seurat::RunUMAP(obj,
+                       reduction = "integrated.cca",
+                       dims = 1:30,
+                       reduction.name = "umap.cca",
+                       seed.use = 10)
+```
+
+Note that `RunUMAP()` is pointed at `integrated.cca` rather than `pca`. That is
+the entire behavioural difference between the integrated and unintegrated
+analyses: same object, same genes, same counts, different reduction.
+
+# Looking again
+
+```{r dimplot_integrated_method, fig.width=8, fig.height=5}
+Seurat::DimPlot(obj, reduction = "umap.cca", group.by = "Method")
+```
+
+```{r dimplot_integrated_celltype, fig.width=9, fig.height=5}
+Seurat::DimPlot(obj, reduction = "umap.cca",
+                group.by = "predicted.celltype.l2")
+```
+
+Compare the first panel with its counterpart above. The single-coloured islands
+are gone; every island is now a speckled mixture of all nine technologies. One
+region at the bottom is still visibly blue, which we come back to in a moment.
+
+The second panel is the one that matters, though, and it is why we ran Azimuth
+first. The Azimuth labels were assigned before integration and never updated, so
+the fact that the islands are now coherent in those labels — B cells along the
+top, monocytes along the bottom, T cells through the middle, each as **one**
+territory rather than several — is not something integration manufactured. It is
+the check that the mixing removed technology rather than biology.
+
+## What did not get fixed
+
+Integration is not erasure, and it is worth looking for what survived rather
+than declaring victory. One region near the bottom of the integrated UMAP is
+still visibly blue — a patch where inDrops cells sit largely on their own instead
+of mixing. Reading it against the cell type panel, it sits inside the monocyte
+territory, which is exactly where the table above said to expect trouble: inDrops
+contributed 490 monocytes and very little else, so that population has far more
+inDrops cells to anchor to each other than to anything from the other batches.
+
+A residual batch-specific patch is not automatically a failure. It can mean the
+correction was incomplete, or it can mean that one protocol genuinely captured a
+state the others missed — which, given that these nine batches differ in capture
+chemistry and lysis, is entirely plausible. The two explanations look identical
+in a UMAP. Telling them apart needs marker genes, not more integration.
+
+# Putting the layers back
+
+Splitting the assay was for integration's benefit. Almost everything downstream —
+differential expression above all — expects a single `counts` layer and a single
+`data` layer rather than nine of each.
+
+```{r join_layers}
+obj <- SeuratObject::JoinLayers(obj)
+obj
+```
+
+Eighteen layers collapse back to three: `counts`, `data`, and the `scale.data`
+that `ScaleData()` produced (it was never split — scaling ran on the joined
+matrix all along).
+
+> **`JoinLayers()` lives in `SeuratObject`, not `Seurat`.** Writing
+> `Seurat::JoinLayers(obj)` gives `'JoinLayers' is not an exported object from
+> 'namespace:Seurat'`. Because both packages are attached by `library(Seurat)`,
+> the unqualified `JoinLayers(obj)` works fine, which is why the mistake survives
+> until someone adds namespaces. `Seurat::` is not a safe blanket prefix for
+> everything in the Seurat ecosystem.
+
+If you want to integrate again — a different method, a different `f =` — you can
+re-split at any time. The split is bookkeeping, not a transformation.
+
+Finally, the prediction score matrices are still there, and worth seeing once so
+that the shape is not a surprise later:
+
+```{r prediction_scores}
+score_mat <- SeuratObject::LayerData(obj,
+                                     assay = "prediction.score.celltype.l1")
+dim(score_mat)
+rownames(score_mat)
+round(score_mat[1:5, 1:5], 3)
+```
+
+Eight rows for the eight level-1 cell types, one column per cell, and each column
+sums to one. `predicted.celltype.l1` is just the row name of the largest entry in
+each column; this matrix is where the rest of the distribution went.
+
+# The two ways to get this badly wrong
+
+Everything above worked because `Method` is very nearly a purely technical
+variable, and because nobody cares which of two healthy donors a PBMC came from.
+Two mistakes break that, and both are common.
+
+## Confounding batch with your biology
+
+Suppose you have twelve donors, six with Alzheimer's disease and six controls,
+and — as happens constantly — the cases were processed in one batch and the
+controls in another. Integrate on batch and you will remove the disease effect,
+because in that design the disease effect *is* the batch effect. The UMAP will
+look beautiful. The differential expression will find nothing, or worse, find
+something.
+
+No integration method can separate two variables that are perfectly confounded;
+this is a property of the design, not a deficiency of the software. What you can
+do:
+
+- **Check first.** `table(obj$batch, obj$condition)` takes one second, and
+  answers whether you have a problem before you spend a day integrating.
+- **Balance at the bench.** Split conditions across batches when the samples are
+  being processed. This is the only real fix, and it happens before any of us see
+  the data.
+- **When it is partial**, integrate on the technical variable and keep the
+  biological one out of the split. With four batches each containing both cases
+  and controls, integrating on batch is safe.
+- **Consider not integrating.** Keeping the batch variable as a covariate in a
+  differential expression model — or moving to pseudobulk, which sidesteps much
+  of this — is often the more defensible route than correcting the embedding.
+
+Run that check on this very dataset before assuming we got away with it:
+
+```{r confounding_check}
+table(obj$Method, obj$Experiment)
+```
+
+`Experiment` is the donor. Four of the nine batches — 10x Chromium v2, v2 A,
+v2 B and v3 — contain cells from **one donor only**, and Seq-Well is 337 to 13.
+So `Method` and donor are *partially* confounded here, and some of what
+integration removed was donor difference rather than protocol difference.
+
+That is survivable in this dataset for two reasons: five batches do span both
+donors, which is enough to anchor the alignment, and donor identity is not the
+thing anyone is trying to measure in a methods-comparison paper. Neither reason
+would hold if the two donors were a case and a control.
+
+> **Do not skip this table on your own data.** It is one line, it runs before
+> anything expensive, and it is the difference between removing a nuisance and
+> removing your result. We ran it here and found partial confounding in a
+> dataset specifically designed to be clean.
+
+## Testing genes on integrated values
+
+The integrated output is a reduction — thirty-odd dimensions with no gene names.
+Some methods can also produce a corrected expression matrix, and it is tempting
+to run differential expression on it.
+
+Do not. Integration deliberately removed variation it decided was batch, using
+anchors that assumed the batches contain the same cell types. Those assumptions
+are fine for arranging cells in a low-dimensional space and inappropriate as
+input to a statistical test, whose p-values assume the values are measurements
+rather than reconstructions.
+
+**Cluster on the integrated reduction; test on the original counts.** Week 4
+takes this up in detail.
+
+# What we glossed over
+
+- **Why 30 dimensions?** Copied from the vignette, and consequential: the number
+  of principal components fed to `IntegrateLayers()` and `RunUMAP()` sets how
+  much structure either one can see. Choosing dimensionality — and clustering on
+  top of the result — is the rest of **Week 3**.
+- **Log-normalization versus `SCTransform`.** `IntegrateLayers()` accepts
+  `normalization.method = "SCT"`, and the whole tutorial runs with SCTransform
+  in place of `NormalizeData()` / `FindVariableFeatures()` / `ScaleData()`. The
+  companion **Week 3** normalization tutorial covers what that substitution
+  actually changes.
+- **Which integration method, and how to tell.** We used CCA and never compared
+  it with the four alternatives, and we never computed a real integration metric
+  — kBET, LISI, silhouette by batch. We judged this one by eye, against labels
+  fixed beforehand, which is honest but not quantitative. Note that any
+  batch-mixing score alone rewards over-correction: a method that mashed
+  everything into one blob would score perfectly, so mixing has to be read
+  against a measure of preserved biology. **Week 4**.
+- **Cell type labeling as a topic.** We ran one reference and read the scores.
+  Choosing a reference, marker-based labeling, MapMyCells, and what to do when no
+  reference fits your tissue are **Week 4**.
+- **Differential expression after integration**, including pseudobulk and
+  putting batch in the model rather than correcting it out — **Week 4**.
+- **Ambient RNA and doublets.** We took `pbmcsca` as distributed and ran no
+  Week 2 cleaning on it. On your own data, that cleaning comes first.
+- **`mapping.score` went unused.** We computed it, quoted its quantiles, and
+  never filtered on it. Cells that map poorly to the reference are exactly the
+  cells whose labels should not be trusted in the evaluation above.
+
+# References
+
+- Ding J, Adiconis X, Simmons SK, *et al.* *Systematic comparative analysis of
+  single-nucleus and single-cell RNA-sequencing methods.* Nature Biotechnology
+  38:737–746, 2020.
+  [doi:10.1038/s41587-020-0465-8](https://doi.org/10.1038/s41587-020-0465-8)
+- Hao Y, Hao S, Andersen-Nissen E, *et al.* *Integrated analysis of multimodal
+  single-cell data.* Cell 184:3573–3587, 2021.
+  [doi:10.1016/j.cell.2021.04.048](https://doi.org/10.1016/j.cell.2021.04.048)
+  — the source of the `pbmcref` reference and of the anchor-based framework.
+- Seurat v5 vignette:
+  [Integrative analysis in Seurat v5](https://satijalab.org/seurat/articles/seurat5_integration)
+- Azimuth:
+  [satijalab.github.io/azimuth](https://satijalab.github.io/azimuth/articles/run_azimuth_tutorial.html)
