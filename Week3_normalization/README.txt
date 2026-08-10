@@ -1,0 +1,1 @@
+Slides for Week 3: https://docs.google.com/presentation/d/1ibfDA2w0Ns3Uy_z3j98enbZ4KCS9c4YTzZzQER4PHD4/edit?usp=sharing
