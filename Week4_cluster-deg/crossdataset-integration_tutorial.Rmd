@@ -1,0 +1,915 @@
+---
+title: "Week 4: Batch correction, part 2 — integrating two studies, and correcting the expression matrix"
+author: "Kevin Z. Lin"
+date: "2026-08-17"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = TRUE, cache.lazy = FALSE, autodep = TRUE)
+knitr::dep_auto()
+```
+
+> **A note on `cache = TRUE` and `autodep`.** As with the other two Week 4
+> documents, every chunk is cached, so the first knit takes a long time and every
+> later one takes a couple of minutes. Chunks whose only output is a figure are
+> marked `cache=FALSE`, because a `ggplot` object stores the environment it was
+> built in and caching one can drag a copy of the whole Seurat object onto disk.
+> `autodep = TRUE` plus `knitr::dep_auto()` makes `knitr` re-run a chunk when the
+> objects it reads have changed — without it a fixed bug upstream can leave a
+> stale figure downstream, with nothing to warn you. Delete `_cache/` and knit
+> once from clean before the document leaves your hands, and exclude `_cache/`
+> from Dropbox or OneDrive syncing.
+
+# Overview
+
+This tutorial was made from the Seurat v4 vignette *Introduction to scRNA-seq
+integration*,
+[https://satijalab.org/seurat/archive/v4.3/integration_introduction](https://satijalab.org/seurat/archive/v4.3/integration_introduction),
+and *Mapping and annotating query datasets*,
+[https://satijalab.org/seurat/articles/integration_mapping](https://satijalab.org/seurat/articles/integration_mapping).
+
+**Week 3 stopped one step short on purpose.** It ran `IntegrateLayers()`, got a
+new *reduction* — a set of coordinates with no gene names attached — and said, in
+so many words: some methods can also give you a corrected expression matrix, it
+is tempting to test genes on it, do not, and Week 4 will explain why. This is
+that explanation, and it starts by actually building one.
+
+Two things are different here.
+
+**The batch is a whole study.** Week 3's batches were nine protocols run on the
+same PBMCs. Here the two batches are two independent research programs — SEA-AD
+in Seattle and ROSMAP through MIT and Rush — with different dissections,
+different chemistries, different reference annotations, different QC decisions,
+and no shared donors at all. This is the hard case, and it is also the common
+one: it is what happens the moment you want to say anything about your data in
+the context of somebody else's.
+
+**The output is an expression matrix, not just an embedding.**
+`FindIntegrationAnchors()` followed by `IntegrateData()` returns an object with a
+second **assay** in it, whose values are genes × cells and which you can put
+straight into `FeaturePlot()`, `DotPlot()`, or — and this is the whole point of
+the tutorial — into `FindMarkers()`, where it will cheerfully give you p-values
+that mean nothing.
+
+The plan:
+
+| Stage | What it produces | Function |
+|---|---|---|
+| 1. Make the two objects comparable | Shared barcodes, shared genes, comparable sizes | `RenameCells()`, `subset()` |
+| 2. Look at them uncorrected | A UMAP with one island per study | `merge()`, `RunPCA()`, `RunUMAP()` |
+| 3. Measure the separation | A per-cell batch-mixing score, against its null | `RANN::nn2()` |
+| 4. Find anchors | Pairs of cells the method believes are the same cell | `FindIntegrationAnchors()` |
+| 5. Correct the expression | A new **assay**, `integrated`, of corrected values | `IntegrateData()` |
+| 6. Look inside it | Fewer genes, no counts, and negative numbers | `LayerData()` |
+| 7. Re-embed, and re-measure | The same mixing score, on corrected values | `RunPCA()`, `RunUMAP()` |
+| 8. Go back to the counts | The assay you actually test on | `JoinLayers()` |
+| 9. The alternative | Reference labels moved onto the query, counts untouched | `TransferData()` |
+
+> **Where this sits in the workshop.** This is the second half of batch
+> correction. **Week 3** produced an integrated reduction on nine PBMC protocols
+> and judged it by eye against labels fixed beforehand; this one produces a
+> corrected expression matrix across two studies and judges it with a number. The
+> companion Week 4 tutorials cluster this dataset and test genes between donors.
+> Bulk deconvolution is **Week 5**.
+
+# Setting up
+
+```{r install}
+# install.packages(c("Seurat", "RANN", "ggplot2", "patchwork"))
+```
+
+```{r libraries}
+library(Seurat)
+library(SeuratObject)
+library(RANN)
+library(ggplot2)
+library(patchwork)
+```
+
+```{r clean_env}
+rm(list = ls())
+```
+
+# The data: two studies, one brain region
+
+**SEA-AD** (Seattle Alzheimer's Disease Brain Cell Atlas) profiled middle
+temporal gyrus across an aged cohort spanning the full range of Alzheimer's
+neuropathology. The file is the same one the other two Week 4 tutorials use: the
+microglia and perivascular-macrophage subset, 40,000 nuclei from 89 donors, with
+the authors' own `Supertype` annotation.
+
+**ROSMAP**, as analysed by Sun *et al.* (2023), profiled immune cells from six
+brain regions across 425 participants of the Religious Orders Study and Rush
+Memory and Aging Project, and assigned each microglial nucleus one of thirteen
+**states**, `MG0` through `MG12`. The file here is the middle temporal cortex
+subset: around ten thousand nuclei from 48 individuals.
+
+> **The region was matched on purpose, and this is the most important design
+> decision in the tutorial.** ROSMAP's largest region by far is prefrontal
+> cortex — six times as many microglia as middle temporal cortex, and the obvious
+> thing to reach for. Pairing SEA-AD's middle temporal gyrus with ROSMAP's
+> prefrontal cortex would have made **study** and **brain region** the same
+> variable. Every difference between the two would then have two explanations,
+> the integration would remove both, and no diagnostic could tell you which one
+> you had lost. Week 3 made the same check with one line, `table(Method,
+> Experiment)`, and found partial confounding in a dataset designed to be clean.
+> Here the check is made before the data is chosen rather than after.
+>
+> Matching the region does not make the two studies comparable. It removes one
+> named reason they are not.
+
+```{r data_dir}
+data_dir <- tempdir(check = TRUE)
+
+# If you have already downloaded either file, point data_dir at the folder
+# holding them and the downloads below will be skipped, e.g.:
+# data_dir <- "/path/to/your/data"
+```
+
+```{r download_seaad}
+options(timeout = 3600)
+
+seaad_url <- paste0("https://www.dropbox.com/scl/fi/cei02rwh3gx61uu9zzeql/",
+                    "seaad_microglia.RData",
+                    "?rlkey=04erfwn3w2lrnr80pefwfh8fu&dl=1")
+seaad_file <- file.path(data_dir, "seaad_microglia.RData")
+seaad_size <- 525672784
+
+if (!file.exists(seaad_file) || file.size(seaad_file) != seaad_size) {
+  download.file(seaad_url, destfile = seaad_file, mode = "wb")
+}
+
+file.size(seaad_file) == seaad_size
+```
+
+```{r download_rosmap}
+## TODO(Kevin): run private/code/rosmap/prep_rosmap_microglia_claude.R, upload
+## the .RData it writes, and replace the two placeholder values below with the
+## dl=1 share link and the byte count the script prints. This chunk cannot run
+## until then. Delete this comment afterwards.
+rosmap_url <- paste0("https://www.dropbox.com/scl/fi/siecgiljoks48pkin42ts/",
+                     "rosmap_microglia.RData",
+                     "?rlkey=vwnmoeynhbsuxkiumz36hy301&dl=1")
+rosmap_file <- file.path(data_dir, "rosmap_microglia.RData")
+rosmap_size <- 1507998516
+
+if (!file.exists(rosmap_file) || file.size(rosmap_file) != rosmap_size) {
+  download.file(rosmap_url, destfile = rosmap_file, mode = "wb")
+}
+
+file.size(rosmap_file) == rosmap_size
+```
+
+> **`options(timeout = 3600)`, `dl=1`, and `mode = "wb"`** are the same three
+> download details the other Week 4 tutorials open with, and they matter for the
+> same reasons: R's default 60-second timeout truncates a large file and reports
+> it as a *warning*; a Dropbox link copied from the Share button ends in `dl=0`
+> and serves an HTML preview page; and without binary mode the file is silently
+> corrupted on Windows. The size comparison is there to check the bytes you got
+> are the bytes you wanted.
+
+```{r load_data}
+load(seaad_file)
+load(rosmap_file)
+
+ls()
+```
+
+> **`load()` does not tell you what it is about to define.** It restores whatever
+> names were in the file when it was saved, straight into your environment, and
+> silently overwrites anything already using those names. The SEA-AD file defines
+> `seurat_obj`; the ROSMAP file defines `rosmap_obj`. Had both used `seurat_obj`,
+> the second `load()` would have destroyed the first with no message at all.
+> `ls()` after a `load()` is a one-second habit worth having. (`readRDS()` avoids
+> the problem entirely by returning its object instead of assigning it, which is
+> a good reason to prefer `.rds` over `.RData` for anything you distribute.)
+
+```{r rename_objects}
+seaad <- seurat_obj
+rosmap <- rosmap_obj
+rm(list = c("seurat_obj", "rosmap_obj")); gc(TRUE)
+
+seaad
+rosmap
+```
+
+```{r inspect_seaad}
+SeuratObject::Layers(seaad[["RNA"]])
+length(unique(seaad$donor_id))
+table(seaad$Supertype)
+```
+
+```{r inspect_rosmap}
+SeuratObject::Layers(rosmap[["RNA"]])
+length(unique(rosmap$donor_id))
+table(rosmap$state)
+table(rosmap$sequencing_batch)
+table(rosmap$ad_diagnosis)
+```
+
+Two asymmetries are already visible and neither goes away.
+
+SEA-AD arrives **log-normalized** (a `counts` layer and a `data` layer); ROSMAP
+arrives as **counts only**. And the two studies do not use the same vocabulary
+for cell identity: SEA-AD has eight `Supertype` labels built around
+microglia/PVM subdivisions, ROSMAP has thirteen `state` labels built around
+activation programs. Neither is wrong, and there is no dictionary between them.
+That is the normal situation when you put two studies side by side, and the last
+section of this tutorial is about what you can do with it.
+
+# Making the two objects comparable
+
+Three things have to be reconciled before any integration method will touch
+them: barcodes, genes, and size.
+
+## Barcodes
+
+```{r rename_cells}
+utils::head(Seurat::Cells(seaad), 3)
+utils::head(Seurat::Cells(rosmap), 3)
+
+seaad <- Seurat::RenameCells(seaad, add.cell.id = "seaad")
+rosmap <- Seurat::RenameCells(rosmap, add.cell.id = "rosmap")
+
+utils::head(Seurat::Cells(seaad), 3)
+utils::head(Seurat::Cells(rosmap), 3)
+```
+
+Cell barcodes are drawn from a fixed 10x whitelist, so two experiments will share
+thousands of them. `merge()` would deduplicate silently by appending suffixes,
+and you would end up with an object whose cell names no longer match the ones in
+any table you saved earlier.
+
+```{r label_dataset}
+seaad$dataset <- "SEA-AD"
+rosmap$dataset <- "ROSMAP"
+```
+
+> **Record the batch as metadata, not as a prefix on the barcode.** It is
+> tempting to recover it later with something like
+> `strsplit(cell_name, "_")[[1]][1]`, and that works right up until a barcode
+> contains an underscore of its own — at which point the parse quietly returns
+> the wrong answer for a subset of your cells. One extra column costs nothing.
+
+## Genes
+
+```{r common_genes}
+length(rownames(seaad))
+length(rownames(rosmap))
+
+common_genes <- intersect(rownames(seaad), rownames(rosmap))
+length(common_genes)
+
+length(setdiff(rownames(seaad), common_genes))
+length(setdiff(rownames(rosmap), common_genes))
+```
+
+```{r subset_genes}
+seaad <- subset(seaad, features = common_genes)
+rosmap <- subset(rosmap, features = common_genes)
+
+dim(seaad)
+dim(rosmap)
+```
+
+> **An intersection is a lossy join, and the loss is not symmetric.** The two
+> studies aligned to different genome annotation releases, so a gene can be
+> missing from one side because it was renamed, because it was retired, or
+> because that study filtered it out. Look at the two `setdiff()` counts above:
+> whichever side loses more is the side whose gene list was longer, which usually
+> means it kept features the other one discarded — antisense transcripts,
+> lncRNAs, and unnamed `ENSG` loci.
+>
+> Anchors are matched by gene *name*, so the row order after subsetting does not
+> matter. What does matter is that a gene you care about can simply be absent
+> from `common_genes`, and nothing will tell you. If a specific marker is central
+> to your question, check for it by name before you spend an hour integrating.
+
+## Size
+
+```{r downsample_seaad}
+ncol(seaad)
+ncol(rosmap)
+
+set.seed(10)
+seaad_cells <- sample(Seurat::Cells(seaad), size = 10000)
+seaad <- subset(seaad, cells = seaad_cells)
+
+ncol(seaad)
+ncol(rosmap)
+```
+
+> **Anchor-based integration is sensitive to gross imbalance in dataset size.**
+> Anchors are mutual nearest neighbours; a cell in the small dataset has far more
+> candidate partners in the large one than the other way round, so the
+> correction is estimated much better in one direction than the other. Forty
+> thousand against ten thousand is a four-to-one ratio, and downsampling is the
+> cheapest way to remove that as an explanation for whatever we see.
+>
+> It also makes the mixing score below interpretable: with two batches of equal
+> size, "perfectly mixed" means half of every cell's neighbours come from the
+> other study, and 0.5 is a number you can hold in your head. And it makes the
+> tutorial knit in a workshop-sized amount of time — which is a real reason, just
+> not a methodological one, and the two should not be confused.
+>
+> On your own data, downsampling to balance is a defensible choice you should
+> **state in your methods**, not a default. Throwing away 30,000 measured nuclei
+> is not free.
+
+## Normalization and variable genes, within each study
+
+```{r normalize_each}
+seaad <- Seurat::NormalizeData(seaad, verbose = FALSE)
+rosmap <- Seurat::NormalizeData(rosmap, verbose = FALSE)
+
+seaad <- Seurat::FindVariableFeatures(seaad, selection.method = "vst",
+                                      nfeatures = 2000, verbose = FALSE)
+rosmap <- Seurat::FindVariableFeatures(rosmap, selection.method = "vst",
+                                       nfeatures = 2000, verbose = FALSE)
+
+length(intersect(Seurat::VariableFeatures(seaad),
+                 Seurat::VariableFeatures(rosmap)))
+```
+
+```{r integration_features}
+integration_features <- Seurat::SelectIntegrationFeatures(
+  object.list = list(seaad, rosmap),
+  nfeatures = 2000,
+  verbose = FALSE)
+
+length(integration_features)
+utils::head(integration_features, 20)
+```
+
+Note how few of the two 2,000-gene lists agree. Each study's variable genes
+partly describe that study's technical character, which is exactly why the gene
+selection has to happen **inside** each batch and then be combined —
+`SelectIntegrationFeatures()` ranks a gene by how often it is variable across the
+datasets, so a gene that is only variable because of one study's chemistry loses
+to a gene that is variable in both.
+
+> **Run `FindVariableFeatures()` on the naively merged object and you select the
+> batch effect.** A gene that is high in study A and low in study B has enormous
+> variance in the pooled data, which is precisely what "highly variable" is
+> measuring. You then hand those genes to PCA and wonder why PC1 is the study.
+> Seurat v5 makes the right thing the default — `merge()` keeps one layer per
+> dataset and `FindVariableFeatures()` operates per layer — but the trap is still
+> live in any code that joins the layers first.
+
+# What the two studies look like uncorrected
+
+```{r merge_objects}
+merged <- merge(seaad, rosmap)
+merged
+
+SeuratObject::Layers(merged[["RNA"]])
+table(merged$dataset)
+```
+
+The layers stayed separate. That is Seurat v5's representation of "these cells
+came from different places", and it is what lets the pipeline below behave
+per-batch without being told to.
+
+```{r uncorrected_pipeline}
+merged <- Seurat::NormalizeData(merged, verbose = FALSE)
+merged <- Seurat::FindVariableFeatures(merged, selection.method = "vst",
+                                       nfeatures = 2000, verbose = FALSE)
+merged <- Seurat::ScaleData(merged, verbose = FALSE)
+
+set.seed(10)
+merged <- Seurat::RunPCA(merged,
+                         features = Seurat::VariableFeatures(merged),
+                         npcs = 30,
+                         reduction.name = "pca.uncorrected",
+                         verbose = FALSE)
+
+set.seed(10)
+merged <- Seurat::RunUMAP(merged,
+                          reduction = "pca.uncorrected",
+                          dims = 1:30,
+                          reduction.name = "umap.uncorrected",
+                          seed.use = 10,
+                          verbose = FALSE)
+
+Seurat::Reductions(merged)
+```
+
+Every reduction here is given an explicit `reduction.name`. The defaults are
+`pca` and `umap`, and a second `RunPCA()` later in the document would overwrite
+the first without comment — leaving you comparing a corrected embedding against
+itself. Naming them costs one argument and removes the possibility.
+
+```{r dimplot_uncorrected, fig.width=7, fig.height=5, cache=FALSE}
+gg <- Seurat::DimPlot(merged, reduction = "umap.uncorrected",
+                      group.by = "dataset", raster = TRUE)
+gg <- gg + ggplot2::ggtitle("Uncorrected, coloured by study")
+plot(gg)
+```
+
+Overplotting can hide a lot in a two-colour UMAP — whichever study is drawn
+second sits on top. `split.by` draws one panel per batch on shared axes, which is
+the honest version of the same figure.
+
+```{r dimplot_uncorrected_split, fig.width=9, fig.height=4.5, cache=FALSE}
+gg <- Seurat::DimPlot(merged, reduction = "umap.uncorrected",
+                      group.by = "dataset", split.by = "dataset",
+                      raster = TRUE)
+plot(gg)
+```
+
+## Measuring the separation instead of describing it
+
+Week 3 judged its integration by eye and said so. A picture is genuinely
+informative here, but it is also the thing most easily talked into agreeing with
+you, and "the batches look reasonably mixed" is not a sentence a reviewer can
+check. The number below is cheap and it is the core idea behind the published
+integration metrics.
+
+For each cell, find its `k` nearest neighbours in the embedding and ask what
+fraction of them came from the *other* study.
+
+```{r mixing_function}
+neighbor_mixing <- function(embedding_mat, batch_vec, k = 30){
+  # nn2 returns each point as its own first neighbour, so drop column 1.
+  nn_out <- RANN::nn2(data = embedding_mat, k = k + 1)
+  nn_idx <- nn_out$nn.idx[, -1, drop = FALSE]
+
+  # batch_vec[nn_idx] unwinds column-major, so rebuild the matrix with the same
+  # nrow to keep cell i on row i.
+  neighbor_batch_mat <- matrix(batch_vec[nn_idx], nrow = nrow(nn_idx))
+
+  rowMeans(neighbor_batch_mat != batch_vec)
+}
+```
+
+```{r mixing_uncorrected}
+dataset_vec <- merged$dataset
+dataset_share <- table(dataset_vec) / length(dataset_vec)
+dataset_share
+
+# Under perfect mixing, a cell's neighbours are a random sample of everything
+# else, so the expected other-study fraction is one minus its own study's share.
+1 - dataset_share
+
+mixing_uncorrected <- neighbor_mixing(
+  embedding_mat = Seurat::Embeddings(merged, "pca.uncorrected")[, 1:30],
+  batch_vec = dataset_vec,
+  k = 30)
+
+tapply(mixing_uncorrected, dataset_vec, stats::median)
+```
+
+Compare the two: the median observed against the value the second line predicts.
+A score near zero means a cell's thirty nearest neighbours in a 30-dimensional
+space all came from its own study — that the strongest thing about a nucleus in
+this embedding is which lab sequenced it.
+
+> **A mixing score alone rewards vandalism.** A method that mapped every cell to
+> the same point would land exactly on the null for both studies — a perfect
+> score, from an embedding containing nothing at all. Mixing is only half of
+> the criterion; the other half is that biological structure survived, which is
+> why the published metrics come in pairs — kBET or LISI for batch mixing,
+> silhouette or cluster purity on known labels for preserved signal — and why
+> Week 3 insisted on holding a cell-type label fixed *before* integrating.
+> Read this number only alongside a picture that still has structure in it.
+
+# Integrating so that the expression matrix is corrected too
+
+Week 3's `IntegrateLayers()` takes an object and returns a reduction. The older
+two-step route takes a **list** of objects and returns a new object carrying a
+second assay.
+
+```{r find_anchors}
+integration_anchors <- Seurat::FindIntegrationAnchors(
+  object.list = list(seaad, rosmap),
+  anchor.features = integration_features,
+  reduction = "cca",
+  dims = 1:30,
+  verbose = FALSE)
+
+class(integration_anchors)
+```
+
+This is the slow step — expect several minutes. Canonical correlation analysis
+finds directions of variation *shared* between the two datasets rather than
+maximal within either; pairs of cells that are mutual nearest neighbours in that
+shared space become **anchors**. An anchor is the method's assertion that *this*
+SEA-AD nucleus and *that* ROSMAP nucleus are the same kind of cell, and
+everything downstream inherits the quality of those assertions.
+
+```{r integrate_data}
+integrated <- Seurat::IntegrateData(anchorset = integration_anchors,
+                                    new.assay.name = "integrated",
+                                    dims = 1:30,
+                                    verbose = FALSE)
+
+integrated
+Seurat::Assays(integrated)
+Seurat::DefaultAssay(integrated)
+```
+
+For each anchor pair, Seurat computes a correction vector — the difference
+between the two cells' expression profiles — and then applies a
+distance-weighted average of nearby anchors' correction vectors to every cell in
+the query dataset. The result is a matrix of the same shape as expression data,
+made of expression data, that is not expression data.
+
+> **`IntegrateData()` changes `DefaultAssay()` and does not say so.** After that
+> one line, every function that does not name an assay explicitly — `FindMarkers()`,
+> `FeaturePlot()`, `AverageExpression()`, `FindVariableFeatures()`, all of them —
+> is reading corrected values instead of your measurements. This is the single
+> most common way the mistake this tutorial is about actually happens: nobody
+> decides to test genes on integrated data, they just never set `DefaultAssay()`
+> back.
+
+```{r join_rna_layers}
+SeuratObject::Layers(integrated[["RNA"]])
+
+integrated[["RNA"]] <- SeuratObject::JoinLayers(integrated[["RNA"]])
+
+SeuratObject::Layers(integrated[["RNA"]])
+```
+
+> **`JoinLayers()` on the whole object fails here, and the error does not explain
+> itself.** Week 3 wrote `SeuratObject::JoinLayers(obj)`, which is correct when
+> every assay is a v5 assay. `IntegrateData()` builds the `integrated` assay as an
+> **old-style v3 `Assay`**, which has no layers to join and no `JoinLayers`
+> method, so the object-level call stops with
+> `no applicable method for 'JoinLayers' applied to an object of class`
+> `"c('Assay', 'KeyMixin')"` — an error that names a class you never asked for
+> and does not mention integration at all. Joining the RNA assay **by name**, as
+> above, sidesteps it. An object holding one v5 assay and one v3 assay is a
+> normal state for Seurat 5 and worth being able to recognize.
+
+# What is actually inside the `integrated` assay
+
+```{r inspect_integrated_assay}
+class(integrated[["integrated"]])
+SeuratObject::Layers(integrated[["integrated"]])
+
+dim(integrated[["RNA"]])
+dim(integrated[["integrated"]])
+```
+
+Three facts, and each is a trap on its own.
+
+**It is a v3 `Assay`, and its only layer is `data`.** There is no `counts` layer,
+because there are no corrected counts — the correction happens in
+log-normalized space and the result cannot be un-logged into integers. Anything
+downstream that reaches for counts, which includes every count-based test in
+existence, cannot use this assay at all. It will not error; `GetAssayData()` will
+warn about a missing layer and hand back `NULL`.
+
+**Most of your genes are gone.** The integrated assay has one row per
+*anchor feature*, so roughly two thousand genes instead of the full shared gene
+list. A gene you did not select as variable does not exist here. You can force
+extra genes in with `IntegrateData(features.to.integrate = ...)`, and it is worth
+knowing that argument exists, but "correct a gene I already know I care about,
+then look at it" is a workflow with an obvious circularity problem.
+
+```{r integrated_values}
+integrated_data <- SeuratObject::LayerData(integrated[["integrated"]],
+                                           layer = "data")
+rna_data <- SeuratObject::LayerData(integrated[["RNA"]], layer = "data")
+
+stopifnot(all(colnames(integrated_data) == colnames(rna_data)))
+
+range(rna_data)
+range(integrated_data)
+sum(integrated_data < 0) / length(integrated_data)
+```
+
+**And the values go negative.** This is the part to hold on to. Log-normalized
+expression is `log1p()` of a non-negative quantity, so it is bounded below by
+zero by construction; a negative number in that matrix is not a low expression
+level, it is not an expression level at all. It is the residue of a subtraction
+between two cells that a nearest-neighbour search decided were comparable.
+
+```{r zero_filling}
+marker_candidates <- c("P2RY12", "CX3CR1", "CSF1R", "C1QB", "APOE", "SPP1")
+marker_gene <- marker_candidates[marker_candidates %in%
+                                   rownames(integrated_data)][1]
+marker_gene
+
+sum(rna_data[marker_gene, ] == 0)
+sum(integrated_data[marker_gene, ] == 0)
+```
+
+Note the second habit worth stealing from that chunk: the marker is *chosen from
+what is present* rather than hard-coded. A gene that survived the intersection
+can still have been dropped by the anchor-feature selection, and a hard-coded
+name would fail three chunks later with `subscript out of bounds`.
+
+The zero counts are the other half of the story. A gene that was undetected in a
+cell — a structural zero, a dropout, a real absence, you cannot tell which — has
+been given a non-zero value by the correction. Every zero-inflation model, every
+detection-rate covariate, every `min.pct` filter is now reading a number that was
+imputed rather than measured.
+
+```{r scatter_rna_vs_integrated, fig.width=7, fig.height=5, cache=FALSE}
+compare_df <- data.frame(
+  rna = rna_data[marker_gene, ],
+  integrated = integrated_data[marker_gene, ],
+  dataset = integrated$dataset)
+
+gg <- ggplot2::ggplot(compare_df,
+                      ggplot2::aes(x = rna, y = integrated, color = dataset))
+gg <- gg + ggplot2::geom_point(size = 0.3, alpha = 0.2)
+gg <- gg + ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed")
+gg <- gg + ggplot2::geom_hline(yintercept = 0, color = "red")
+gg <- gg + ggplot2::labs(x = paste0(marker_gene, ", measured (log-normalized)"),
+                         y = paste0(marker_gene, ", after integration"),
+                         title = "The same gene, the same cells, two matrices")
+plot(gg)
+```
+
+The dashed line is where the two would agree. The red line is zero: everything
+below it is a value with no possible interpretation as an amount of RNA. Note
+also that the vertical stripe at `x = 0` — the cells where this gene was not
+detected — has been spread across a range of corrected values, and that the two
+studies are shifted differently, which is the correction doing its job.
+
+# Re-embedding on the corrected values
+
+```{r embed_integrated}
+Seurat::DefaultAssay(integrated) <- "integrated"
+
+integrated <- Seurat::ScaleData(integrated, verbose = FALSE)
+
+set.seed(10)
+integrated <- Seurat::RunPCA(integrated,
+                             npcs = 30,
+                             reduction.name = "pca.integrated",
+                             verbose = FALSE)
+
+set.seed(10)
+integrated <- Seurat::RunUMAP(integrated,
+                              reduction = "pca.integrated",
+                              dims = 1:30,
+                              reduction.name = "umap.integrated",
+                              seed.use = 10,
+                              verbose = FALSE)
+
+Seurat::Reductions(integrated)
+```
+
+```{r dimplot_comparison, fig.width=10, fig.height=4.5, cache=FALSE}
+gg1 <- Seurat::DimPlot(merged, reduction = "umap.uncorrected",
+                       group.by = "dataset", raster = TRUE) +
+  ggplot2::ggtitle("Before")
+gg2 <- Seurat::DimPlot(integrated, reduction = "umap.integrated",
+                       group.by = "dataset", raster = TRUE) +
+  ggplot2::ggtitle("After")
+plot(gg1 + gg2)
+```
+
+```{r mixing_integrated}
+mixing_integrated <- neighbor_mixing(
+  embedding_mat = Seurat::Embeddings(integrated, "pca.integrated")[, 1:30],
+  batch_vec = integrated$dataset,
+  k = 30)
+
+tapply(mixing_uncorrected, merged$dataset, stats::median)
+tapply(mixing_integrated, integrated$dataset, stats::median)
+1 - dataset_share
+```
+
+```{r mixing_histogram, fig.width=8, fig.height=4, cache=FALSE}
+mixing_df <- rbind(
+  data.frame(mixing = mixing_uncorrected, dataset = merged$dataset,
+             stage = "before"),
+  data.frame(mixing = mixing_integrated, dataset = integrated$dataset,
+             stage = "after"))
+mixing_df$stage <- factor(mixing_df$stage, levels = c("before", "after"))
+
+gg <- ggplot2::ggplot(mixing_df,
+                      ggplot2::aes(x = mixing, fill = dataset))
+gg <- gg + ggplot2::geom_histogram(bins = 40, alpha = 0.6,
+                                   position = "identity")
+gg <- gg + ggplot2::facet_wrap(~ stage)
+gg <- gg + ggplot2::geom_vline(xintercept = 0.5, linetype = "dashed")
+gg <- gg + ggplot2::labs(x = "fraction of 30 neighbours from the other study",
+                         y = "cells")
+plot(gg)
+```
+
+The dashed line is the balanced-design null. Read the *shape*, not only the
+median: a distribution piled at zero with a thin tail says most cells never left
+their own study, and a broad distribution centred near the line says the mixing
+is general rather than driven by a handful of cells. A bimodal one — a mixed
+population and an unmixed one — usually means a cell type that only one study
+captured, and that is worth finding before you interpret anything.
+
+> **Residual separation is not automatically a failure.** Two studies with
+> different dissections and different chemistries can genuinely capture different
+> states, and "the correction was incomplete" and "one study saw something the
+> other did not" look identical in a UMAP. Telling them apart needs marker genes,
+> not more integration. Week 3 hit the same ambiguity and left it standing for the
+> same reason.
+
+# Going back to the counts
+
+```{r back_to_rna}
+Seurat::DefaultAssay(integrated) <- "RNA"
+Seurat::DefaultAssay(integrated)
+
+SeuratObject::Layers(integrated[["RNA"]])
+```
+
+This is the whole discipline in two lines. The corrected assay is still there,
+the reductions built from it are still there, and everything that reports a
+number about a gene now reads the measurements again.
+
+The rule, stated once:
+
+> **Cluster and visualize on the integrated output. Test on the original
+> counts.**
+
+The reason is not a convention and it is worth being able to say out loud.
+Integration deliberately removed variation it judged to be batch, using anchors
+that *assumed* the two studies contain the same cell types. A statistical test
+takes its input to be measurements with a known noise model — Poisson-ish
+counts, or something you are willing to treat as normal — and computes how
+surprising the observed difference is under that model. The corrected values are
+neither. They are reconstructions whose errors are correlated across cells in
+exactly the pattern the anchors imposed, and which have already had between-study
+differences shrunk toward zero. The p-value that comes out is a real number
+computed from the wrong thing; it does not come with a warning, and it is usually
+*smaller* than the honest one, because the correction removed the variance the
+test was supposed to be measuring against.
+
+The right way to handle batch in a test is to keep it in the model rather than
+remove it from the data — a `~ batch + condition` design on pseudobulk, which is
+the companion Week 4 tutorial's subject.
+
+> **So what is the corrected matrix legitimately for?** It is a *presentation*
+> and *input* layer, not an evidence layer.
+>
+> - Plotting a gene across batches — `FeaturePlot()`, `DotPlot()`, `VlnPlot()` —
+>   where an uncorrected panel would mostly show you which study each cell came
+>   from.
+> - Heatmaps of a marker panel across studies, for the same reason.
+> - Feeding a downstream method that wants a genes × cells matrix and has no
+>   batch term of its own: some trajectory methods, some matrix-factorization and
+>   gene-program methods.
+>
+> Everything on that list is descriptive. Nothing on it produces a p-value, a
+> fold change, or a confidence interval. That is the line.
+
+```{r featureplot_comparison, fig.width=10, fig.height=4.5, cache=FALSE}
+Seurat::DefaultAssay(integrated) <- "RNA"
+gg1 <- Seurat::FeaturePlot(integrated, features = marker_gene,
+                           reduction = "umap.integrated", raster = TRUE) +
+  ggplot2::ggtitle(paste0(marker_gene, ", measured"))
+
+Seurat::DefaultAssay(integrated) <- "integrated"
+gg2 <- Seurat::FeaturePlot(integrated, features = marker_gene,
+                           reduction = "umap.integrated", raster = TRUE) +
+  ggplot2::ggtitle(paste0(marker_gene, ", corrected"))
+
+Seurat::DefaultAssay(integrated) <- "RNA"
+plot(gg1 + gg2)
+```
+
+Two panels, one gene, one set of coordinates, one argument different — and the
+argument was never written down anywhere in the figure. If you make plots from
+both assays in the same analysis, put the assay in the title, every time.
+
+# The alternative that never edits expression: label transfer
+
+There is a second thing people usually want when they reach for integration, and
+it does not require correcting anything. **What are my cells, in someone else's
+vocabulary?** ROSMAP's nuclei have `state` labels; SEA-AD's have `Supertype`
+labels; the question is how they correspond.
+
+```{r transfer_anchors}
+transfer_anchors <- Seurat::FindTransferAnchors(reference = seaad,
+                                                query = rosmap,
+                                                dims = 1:30,
+                                                verbose = FALSE)
+
+predictions_df <- Seurat::TransferData(anchorset = transfer_anchors,
+                                       refdata = seaad$Supertype,
+                                       dims = 1:30,
+                                       verbose = FALSE)
+
+dim(predictions_df)
+utils::head(colnames(predictions_df))
+utils::head(predictions_df[, c("predicted.id", "prediction.score.max")], 5)
+```
+
+```{r attach_predictions}
+rosmap <- Seurat::AddMetaData(rosmap, metadata = predictions_df)
+
+table(rosmap$predicted.id)
+stats::quantile(rosmap$prediction.score.max)
+```
+
+Note what did **not** happen: `rosmap` still holds its own counts, unmodified.
+The anchors were used to move a *label* rather than to move the data, so
+everything downstream — pseudobulk aggregation, DESeq2, composition testing —
+operates on measurements.
+
+```{r label_crosstab}
+label_tab <- table(rosmap$state, rosmap$predicted.id)
+label_tab
+
+round(label_tab / rowSums(label_tab), 2)
+```
+
+The row proportions are the readable version: for each ROSMAP state, where do
+those nuclei land in SEA-AD's vocabulary? A row concentrated in one column is a
+state the reference recognizes. A row spread across several is a state the
+reference has no name for, and this is where the method's central limitation
+shows.
+
+> **Label transfer cannot say "I do not know".** Every query cell gets the
+> reference's best-matching label, whether or not the reference contains anything
+> like it. A microglial activation state that SEA-AD's supertypes do not resolve
+> does not come back as unlabelled; it comes back as the nearest supertype, with
+> a confident-looking integer count in a table. `prediction.score.max` is the only
+> thing standing between you and that — cells whose best score is barely above
+> their second-best are cells whose label you should not use. Look at the
+> quantiles above, pick a floor, and say what it was.
+>
+> The same caution applies in reverse to the direction of the transfer. We made
+> SEA-AD the reference because its annotation is the one being borrowed; running
+> it the other way, with ROSMAP's thirteen states as the reference, is a different
+> analysis and can disagree.
+
+# What we glossed over
+
+- **We used CCA and compared it with nothing.** `FindIntegrationAnchors()` takes
+  `reduction = "rpca"` (faster, more conservative — the recommended choice when
+  the datasets are large or share little), and `IntegrateLayers()` in **Week 3**
+  reaches Harmony, FastMNN and scVI through one argument. Running two methods and
+  comparing them with the mixing score above costs one line and an hour, and
+  "we used CCA because it was in the tutorial" is not a methods section.
+- **Real integration metrics.** The neighbour-mixing score here is the idea
+  behind LISI, boiled down to something you can read in the source. The published
+  benchmarks — kBET, iLISI/cLISI, silhouette by batch and by label, and the
+  composite scores in Luecken *et al.* — are what you would report. All of them
+  pair a mixing measure with a biology-preservation measure, for the reason given
+  above.
+- **`SCTransform`.** Both routes accept `normalization.method = "SCT"`, but the
+  anchor route additionally needs `PrepSCTIntegration()` before
+  `FindIntegrationAnchors()`, and skipping it produces a wrong answer rather than
+  an error. The **Week 3** normalization tutorial covers what SCTransform changes.
+- **More than two datasets.** With many batches, `FindIntegrationAnchors(reference
+  = c(1, 2))` integrates everything against a designated subset instead of
+  all-against-all, which is the difference between an afternoon and a week.
+  `sample.tree` in `IntegrateData()` controls the merge order, which is not
+  cosmetic.
+- **`k.anchor`, `k.filter`, `k.weight`.** Left at defaults. `k.weight` is the one
+  that will actually break on you: it must not exceed the number of cells in the
+  smallest dataset, and a small batch produces an error deep inside
+  `IntegrateData()` that does not name the argument.
+- **How many dimensions.** Thirty, everywhere, taken from the vignette and never
+  defended — the same unexamined choice Week 3 flagged. It sets how much
+  structure both the anchor-finding and the UMAP can see.
+- **Whether these two studies should be integrated at all.** They have no shared
+  donors and no shared protocol, so "study" is confounded with everything about
+  how the tissue was collected and processed. Integration will always produce
+  output. Whether the aligned populations are the same biology is a claim the
+  method cannot make for you.
+- **Cleaning.** Both objects arrive filtered by their authors, so **Week 2**'s
+  ambient RNA and doublet work is invisible here. It comes first on your own data,
+  and it comes first *per study* — ambient RNA profiles are study-specific.
+
+# References
+
+- Stuart T, Butler A, Hoffman P, *et al.* (2019). "Comprehensive integration of
+  single-cell data." *Cell* 177:1888–1902.
+  [doi:10.1016/j.cell.2019.05.031](https://doi.org/10.1016/j.cell.2019.05.031)
+  — the anchor method used throughout this tutorial.
+- Hao Y, Stuart T, Kowalski MH, *et al.* (2024). "Dictionary learning for
+  integrative, multimodal and scalable single-cell analysis" (Seurat v5).
+  *Nature Biotechnology* 42:293–304.
+  [doi:10.1038/s41587-023-01767-y](https://doi.org/10.1038/s41587-023-01767-y)
+- Luecken MD, Büttner M, Chaichoompu K, *et al.* (2022). "Benchmarking
+  atlas-level data integration in single-cell genomics." *Nature Methods*
+  19:41–50.
+  [doi:10.1038/s41592-021-01336-8](https://doi.org/10.1038/s41592-021-01336-8)
+  — the source for kBET, LISI and the mixing-versus-preservation framing.
+- Sun N, Victor MB, Park YP, *et al.* (2023). "Human microglial state dynamics
+  in Alzheimer's disease progression." *Cell* 186:4386–4403.
+  [doi:10.1016/j.cell.2023.08.037](https://doi.org/10.1016/j.cell.2023.08.037)
+  — the ROSMAP microglia and the `MG0`–`MG12` states.
+  Project page: [https://compbio.mit.edu/microglia_states/](https://compbio.mit.edu/microglia_states/)
+- Gabitto MI, Travaglini KJ, Rachleff VM, *et al.* (2024). "Integrated multimodal
+  cell atlas of Alzheimer's disease" (SEA-AD).
+  [https://portal.brain-map.org/explore/seattle-alzheimers-disease](https://portal.brain-map.org/explore/seattle-alzheimers-disease)
+- Prater KE, Lin KZ (2025). "All the single cells: single-cell
+  transcriptomics/epigenomics experimental design and analysis considerations for
+  glial biologists." *Glia* 73:451–473.
+  [doi:10.1002/glia.24633](https://doi.org/10.1002/glia.24633)
+  — §3.3 on batch correction covers this tutorial directly.
