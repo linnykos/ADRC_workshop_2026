@@ -1,0 +1,1204 @@
+---
+title: "Week 4: Differential expression across donors, and what the genes mean"
+author: "Kevin Z. Lin"
+date: "2026-08-15"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = TRUE, cache.lazy = FALSE, autodep = TRUE)
+knitr::dep_auto()
+```
+
+> **A note on `cache = TRUE`, and on the `autodep` line next to it.** This
+> document caches every chunk, so the first knit is slow and later ones take a
+> couple of minutes. Two things are worth knowing before you rely on that.
+>
+> First, the disk cost: `knitr` re-saves every object a chunk *modifies*, and
+> single-cell objects are large, so `_cache/` reaches gigabytes. Every chunk here
+> whose only output is a figure is marked `cache=FALSE`, because a `ggplot`
+> object stores the environment it was built in and caching one can drag a copy
+> of the whole Seurat object onto disk with it. Exclude `_cache/` from Dropbox,
+> OneDrive or Google Drive syncing, and delete it if a knit is interrupted — a
+> truncated cache reappears on the next run as `error reading from connection`.
+>
+> Second, and more dangerous: **by default `knitr` caches each chunk
+> independently and does not re-run a chunk when the objects it depends on
+> change.** Edit an upstream chunk, re-knit, and a downstream figure can silently
+> remain the *old* figure — a document whose text and plots disagree, with
+> nothing to warn you. `autodep = TRUE` plus `knitr::dep_auto()` makes `knitr`
+> track which chunks read which objects and invalidate accordingly. It is not
+> perfect. Before anything leaves your hands, delete `_cache/` and knit once from
+> clean.
+
+# Overview
+
+This tutorial was made from the DESeq2 vignette,
+[https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html](https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html),
+the `clusterProfiler` book,
+[https://yulab-smu.top/biomedical-knowledge-mining-book/](https://yulab-smu.top/biomedical-knowledge-mining-book/),
+and the pseudobulk section of the Harvard Chan Bioinformatics Core single-cell
+course. The diagnostic steps in between are the checks worth running before you
+trust any donor-level result.
+
+The companion Week 4 tutorial clustered microglia and asked *what distinguishes
+one cluster from another*. This one asks a completely different question:
+
+> **What is different between these people?**
+
+Both questions are called "differential expression," both are answered with a
+table of genes and p-values, and they are **not the same analysis**. Confusing
+them is the single most common error in this corner of the field, and it is the
+reason this session has two tutorials.
+
+The difference is what counts as a replicate. When you ask what makes cluster 3
+different from cluster 5, your replicates are cells, and you have thousands. When
+you ask what makes a donor with Alzheimer's disease different from one without,
+your replicates are **donors**, and you have dozens at best. Testing that second
+question with cells as replicates treats 500 nuclei from one brain as 500
+independent observations of that person's biology. They are not — they came from
+one piece of tissue, processed in one library, from one individual. Do it anyway
+and you get p-values of `1e-80` for genes that would not survive a look at the
+donor-level averages.
+
+The fix is **pseudobulk**: sum the counts across all cells of a given type within
+each donor, producing one profile per donor, then analyze that with the bulk
+RNA-seq tools that were built for exactly this design.
+
+The plan:
+
+| Stage | What it produces | Function |
+|---|---|---|
+| 1. Pick a population and check it is testable | A cells-per-donor table you looked at before deciding | `table()` |
+| 2. Aggregate | One column per donor, in raw counts | `AggregateExpression()` |
+| 3. Filter | A gene universe chosen on expression, not on variability | `rowSums()` |
+| 4. Check the design | A full-rank model matrix, verified | `model.matrix()`, `qr()` |
+| 5. Look before testing | Sample-sample correlation, PCA on the pseudobulk | `vst()`, `plotPCA()` |
+| 6. Test | Log fold changes and p-values per gene | `DESeq()`, `results()` |
+| 7. Shrink | Fold changes you can rank | `lfcShrink()` |
+| 8. Ask what the genes do | Enriched biological processes | `gseGO()` |
+
+> **Where this sits in the workshop.** Week 1 ran a whole pipeline on defaults
+> and defended nothing. Week 2 cleaned the data. Week 3 normalized it, picked
+> genes, and did batch correction part one. This session is the payoff: the
+> companion tutorial clusters and labels, and this one tests. Bulk deconvolution
+> is **Week 5**.
+
+# Setting up
+
+Everything here is on CRAN or Bioconductor. Install once, then leave these lines
+commented.
+
+```{r install}
+# install.packages(c("Seurat", "ggplot2", "pheatmap", "RColorBrewer"))
+# if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install(c("DESeq2", "apeglm", "EnhancedVolcano",
+#                        "clusterProfiler", "org.Hs.eg.db", "enrichplot",
+#                        "variancePartition"))
+```
+
+```{r libraries}
+library(Seurat)
+library(SeuratObject)
+library(DESeq2)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(variancePartition)
+library(ggplot2)
+library(pheatmap)
+```
+
+```{r clean_env}
+rm(list = ls())
+```
+
+# The data
+
+The dataset is a 40,000-nucleus microglia subset of **SEA-AD** (Seattle
+Alzheimer's Disease Brain Cell Atlas), middle temporal gyrus, distributed as a
+Seurat object. The companion clustering tutorial describes it in full; here we
+need only three things from it — the raw counts, the donor each nucleus came
+from, and the donor's neuropathology.
+
+The file downloads itself into a temporary folder, so this tutorial runs as-is
+with nothing to set up. It is **525 MB**, so expect the first run to take a few
+minutes on a decent connection.
+
+```{r data_dir}
+data_dir <- tempdir(check = TRUE)
+
+# If you have already downloaded seaad_microglia.RData, point data_dir at the
+# folder holding it instead and the download below will be skipped, e.g.:
+# data_dir <- "/path/to/your/data"
+```
+
+```{r download}
+options(timeout = 3600)
+
+data_url <- paste0("https://www.dropbox.com/scl/fi/cei02rwh3gx61uu9zzeql/",
+                   "seaad_microglia.RData",
+                   "?rlkey=04erfwn3w2lrnr80pefwfh8fu&dl=1")
+data_file <- file.path(data_dir, "seaad_microglia.RData")
+expected_size <- 525672784
+
+if (!file.exists(data_file) || file.size(data_file) != expected_size) {
+  download.file(data_url, destfile = data_file, mode = "wb")
+}
+
+file.size(data_file) == expected_size
+```
+
+> **Three details in that download, and every one of them has bitten someone.**
+>
+> **`options(timeout = 3600)`.** R's default download timeout is **60 seconds**,
+> which is not enough for half a gigabyte on any normal connection. Without this
+> line the transfer dies partway through with
+> `downloaded length 106201070 != reported length 525672784` — and because that
+> arrives as a *warning* rather than an error, a script can sail past it and fail
+> later at `load()` with a message about a corrupt file. This is the single most
+> common reason a large `download.file()` "doesn't work" in R.
+>
+> **`dl=1`, not `dl=0`.** Copying a Dropbox share link gives you `dl=0`, which
+> serves the HTML preview page. You would download a web page, and `load()` would
+> complain about a bad magic number.
+>
+> **`mode = "wb"`.** Forces a binary write. Without it the file is silently
+> corrupted on Windows.
+>
+> The size comparison at the end is the point of all three: **verify the bytes you
+> got are the bytes you wanted**, rather than trusting that no error appeared.
+
+```{r load_data}
+load(data_file)
+seurat_obj
+```
+
+> **`load()` is not `readRDS()`.** `load()` drops whatever objects the file
+> happened to contain into your workspace under whatever names they were saved
+> with, and it does **not** return a value — `x <- load("f.RData")` assigns a
+> character vector of names, not your data, which is a genuinely confusing first
+> encounter. Run `ls()` after every `load()` to see what you actually got, and
+> prefer `saveRDS()` / `readRDS()` in your own work: those handle exactly one
+> object and let *you* name it.
+
+```{r list_objects}
+ls()
+```
+
+The metadata is where the clinical variables live. There are 43 columns; these
+are the ones this tutorial uses.
+
+```{r metadata_columns}
+head(seurat_obj@meta.data[, c("donor_id", "Supertype", "assay", "sex",
+                              "ADNC", "APOE4.status", "Cognitive.status")])
+```
+
+`ADNC` is the **Alzheimer's Disease Neuropathologic Change** score — the
+autopsy-derived measure of how much AD pathology the brain actually had, on a
+four-level scale plus a `Reference` category for the neurotypical donors used to
+build the atlas.
+
+```{r adnc_table}
+table(seurat_obj$ADNC)
+table(seurat_obj$assay)
+```
+
+## Two subsets, both deliberate
+
+```{r subset_object}
+seurat_obj <- subset(seurat_obj,
+                     ADNC %in% c("High", "Intermediate", "Low", "Not AD"))
+seurat_obj <- subset(seurat_obj, assay == "10x 3' v3")
+seurat_obj
+```
+
+The first line drops the `Reference` donors. They are a different cohort recruited
+under different criteria, and they have no ADNC score to compare — including them
+would mean silently comparing across studies.
+
+The second line keeps a single chemistry. SEA-AD ran both 10x 3' v3 and 10x
+multiome, and **27 donors appear in both**. If you aggregate by donor without
+splitting on assay, those donors get one profile that pools two different library
+preparations; if you split on both, they contribute twice and are no longer
+independent. Restricting to one chemistry avoids the question entirely, at the
+cost of some cells. Week 3's integration material is about the other option.
+
+```{r donor_count}
+length(unique(seurat_obj$donor_id))
+```
+
+# Choosing a population to test
+
+Pseudobulk is done **within a cell type**, not across all cells at once — the
+whole point is to ask whether microglia of a given state differ between donors,
+and averaging distinct states together would hide that. SEA-AD ships its own
+fine-grained labels in `Supertype`.
+
+Before picking one, look at how many cells each donor contributes to each. This
+is the diagnostic that decides whether the analysis is possible at all, and it is
+worth running before you have any attachment to a particular comparison.
+
+```{r cells_per_supertype}
+cells_tab <- table(seurat_obj$Supertype, seurat_obj$donor_id)
+dim(cells_tab)
+
+apply(cells_tab, 1,
+      function(x) c(donors_with_10_or_more = sum(x >= 10),
+                    median_cells = median(x),
+                    max_cells = max(x)))
+```
+
+Read that table as a feasibility check, not a summary. `Micro-PVM_2` is present
+in nearly every donor at a workable depth. `Micro-PVM_2_1-SEAAD` and
+`Micro-PVM_4-SEAAD` are present in a handful of donors at a median of one cell
+each — there is no donor-level comparison to be made there, and running DESeq2 on
+them would produce a table of numbers that mean nothing.
+
+> **This is why you look first.** A pipeline that loops DESeq2 over every cluster
+> will happily return results for the clusters that have no business being
+> tested, and those results look exactly like the real ones. The
+> cells-per-donor-per-cluster table is the cheapest guard against that, and it
+> takes one line.
+
+We take `Micro-PVM_2`.
+
+```{r subset_supertype}
+seurat_obj <- subset(seurat_obj, Supertype == "Micro-PVM_2")
+seurat_obj
+
+summary(as.vector(table(seurat_obj$donor_id)))
+```
+
+# Aggregating to pseudobulk
+
+`AggregateExpression()` sums raw counts within each group. Passing several
+variables to `group.by` puts all of them in the resulting object's metadata,
+which saves reassembling the donor table by hand.
+
+```{r aggregate}
+pseudo_seurat <- Seurat::AggregateExpression(
+  seurat_obj,
+  assays = "RNA",
+  return.seurat = TRUE,
+  group.by = c("donor_id", "APOE4.status", "ADNC", "sex"),
+  verbose = FALSE)
+
+pseudo_seurat
+head(pseudo_seurat@meta.data)
+```
+
+One column per donor. Note what just happened to the size of the problem: tens of
+thousands of cells became `r ncol(pseudo_seurat)` columns, and that number — not
+the cell count — is the sample size every p-value below is based on.
+
+> **Sum, not mean.** `AggregateExpression()` defaults to summing counts, and that
+> is what you want. DESeq2 models raw counts with a negative binomial and derives
+> its own size factors; handing it averages, or normalized values, breaks the
+> assumption it uses to estimate dispersion. If you take one thing from this
+> section: pseudobulk means *sum the counts*, then let the bulk tool normalize.
+
+Pull out the count matrix and the metadata.
+
+```{r extract_pseudobulk}
+mat_pseudobulk <- SeuratObject::LayerData(pseudo_seurat,
+                                          layer = "counts",
+                                          assay = "RNA")
+metadata_pseudobulk <- pseudo_seurat@meta.data
+
+dim(mat_pseudobulk)
+mat_pseudobulk[1:5, 1:3]
+```
+
+## How many cells is each column made of?
+
+A pseudobulk column built from 800 nuclei and one built from 2 nuclei are not
+comparable, and nothing downstream will tell you which is which. Record it.
+
+```{r n_cells}
+cells_per_donor <- table(seurat_obj$donor_id)
+metadata_pseudobulk[, "n_cells"] <-
+  as.vector(cells_per_donor[metadata_pseudobulk[, "donor_id"]])
+
+summary(metadata_pseudobulk[, "n_cells"])
+sort(metadata_pseudobulk[, "n_cells"])[1:8]
+```
+
+```{r filter_low_cells}
+min_cells <- 10
+keep_samples <- metadata_pseudobulk[, "n_cells"] >= min_cells
+sum(!keep_samples)
+
+mat_pseudobulk <- mat_pseudobulk[, keep_samples]
+metadata_pseudobulk <- metadata_pseudobulk[keep_samples, ]
+dim(mat_pseudobulk)
+```
+
+`min_cells = 10` is a judgment call, not a standard. The point is that some
+threshold is needed and that yours should be stated.
+
+## Preparing the variables
+
+DESeq2 needs the variables in the design to be factors, and for each factor it
+needs to know which level is the **reference** — the baseline that every other
+level is reported against. If you do not say, R takes the alphabetically first
+level.
+
+```{r prepare_metadata}
+metadata_pseudobulk[, "sex"] <- factor(metadata_pseudobulk[, "sex"])
+metadata_pseudobulk[, "APOE4.status"] <-
+  factor(metadata_pseudobulk[, "APOE4.status"])
+
+adnc_vec <- rep("NonAD", nrow(metadata_pseudobulk))
+adnc_vec[metadata_pseudobulk[, "ADNC"] %in% c("High", "Intermediate")] <- "AD"
+metadata_pseudobulk[, "ADNC"] <- relevel(factor(adnc_vec), ref = "NonAD")
+
+summary(metadata_pseudobulk[, c("sex", "APOE4.status", "ADNC")])
+```
+
+> **Why the reference level matters: it decides the direction, not the
+> statistics.** For a two-level factor the fit is symmetric. Swap the reference
+> and DESeq2 estimates the same dispersions, the same Wald statistic up to sign,
+> and **identical p-values**. What changes is which way round the comparison is
+> reported. Our two levels are `AD` and `NonAD`, and `AD` sorts first
+> alphabetically — so without the `relevel()` above, DESeq2 would treat AD as the
+> baseline and give you a coefficient named `ADNC_NonAD_vs_AD`. Every
+> `log2FoldChange` in this tutorial would then carry the opposite sign: the
+> right-hand side of the volcano plot would be genes higher in *controls*, the
+> "upregulated in AD" list would be the downregulated one, and the GSEA at the
+> end — which ranks genes by the signed Wald statistic — would report every
+> pathway with its enrichment score flipped. Nothing errors, no number looks
+> wrong, and the biology you write down is backwards. So the answer to "why does
+> it matter if it is not the one I meant" is: it matters entirely for
+> interpretation, and interpretation is the whole output.
+>
+> Two consequences. First, the fix is not to remember which level sorts first —
+> it is to set the reference on purpose and then **read `resultsNames()`** after
+> fitting, which spells the comparison out as `variable_level_vs_reference`. We
+> do that below. Second, with more than two levels the reference does more than
+> set a sign: it decides which contrasts exist as coefficients at all. With
+> `Not AD` as the reference you get `High vs Not AD`, `Low vs Not AD` and so on,
+> and `High vs Low` is not among them — you would have to request it explicitly
+> with `results(dds, contrast = c("ADNC", "High", "Low"))`.
+
+Collapsing four ADNC levels into two is a modelling decision with consequences:
+it buys power and a fold change that is easy to describe, and it throws away the
+ordering. `Low` and `Not AD` become the same thing; so do `High` and
+`Intermediate`. An ordinal model, or ADNC as a numeric trend, is the alternative
+and is not obviously worse.
+
+## Check the alignment before you trust it
+
+DESeq2 matches columns of the count matrix to rows of the metadata **by
+position**, not by name. If they ever fall out of order, every result is wrong
+and nothing errors.
+
+```{r check_alignment}
+all(colnames(mat_pseudobulk) == rownames(metadata_pseudobulk))
+```
+
+> **The check that has to be there.** Print a sample-order confirmation before
+> every DE run — it costs one line, and this is why. A mis-joined
+> metadata table produces a complete, plausible, entirely fictional result set.
+> There is no downstream symptom.
+
+# Choosing which genes to test
+
+The tempting shortcut here is to reuse the 2,000 variable genes the clustering
+workflow already selected. They are sitting right there in the object, and
+testing 2,000 genes instead of 15,000 is faster and gives a gentler multiple-
+testing correction. It is a trap, and it is worth naming.
+
+> **Do not select genes on variability and then test them for differential
+> expression.** `FindVariableFeatures()` ranks genes by how much they vary
+> *across cells* — which includes the between-donor variation you are about to
+> test. Choosing the top 2,000 on that criterion and then asking which of them
+> differ between donor groups is selecting on the outcome. It also silently
+> redefines the multiple-testing universe: your FDR is now computed over a set
+> that was already enriched for what you are looking for.
+
+Filter on **detection** instead, which is orthogonal to the contrast: keep genes
+seen in a reasonable number of donors. The equivalent filter can also be applied
+at the single-cell level before aggregating.
+
+```{r filter_genes}
+min_samples <- ceiling(0.25 * ncol(mat_pseudobulk))
+min_samples
+
+genes_detected <- Matrix::rowSums(mat_pseudobulk >= 5) >= min_samples
+sum(genes_detected)
+
+mat_pseudobulk <- mat_pseudobulk[genes_detected, ]
+dim(mat_pseudobulk)
+```
+
+# The design
+
+```{r design}
+design_formula <- ~ sex + APOE4.status + ADNC
+design_mat <- model.matrix(design_formula, metadata_pseudobulk)
+
+colnames(design_mat)
+dim(design_mat)
+```
+
+`ADNC` is the contrast of interest; `sex` and `APOE4.status` are in the model to
+be adjusted for. Everything in the formula that is not the term you read out is
+a covariate, and adding covariates costs degrees of freedom — with 80-odd donors
+that is affordable, with 8 it is not.
+
+A design matrix that is not full rank makes DESeq2 fail, or worse, silently
+estimate something other than what you wrote. Check it.
+
+```{r check_rank}
+qr(design_mat)$rank
+ncol(design_mat)
+qr(design_mat)$rank == ncol(design_mat)
+```
+
+> **Do not "fix" this automatically.** The obvious repair is to drop design
+> columns in a loop until the matrix inverts, and it is a repair you will find
+> written into pipelines because it keeps them running on small unbalanced
+> cohorts. The cost is that the model which was fitted is no longer the model
+> that was specified, and unless the code says which columns it dropped, nothing
+> in the output tells you that happened — you get a clean table of results for a
+> question you did not ask. If
+> your design is not full rank, the honest responses are to drop a covariate on
+> purpose, collapse a level, or accept that the comparison is not identifiable in
+> your data.
+
+Full rank is a low bar, though. It says the coefficients are *identifiable*, not
+that they are estimated from a balanced comparison. Cross-tabulate the covariates
+against the contrast and look at the cells:
+
+```{r confounding_check}
+table(metadata_pseudobulk[, "ADNC"], metadata_pseudobulk[, "sex"])
+table(metadata_pseudobulk[, "ADNC"], metadata_pseudobulk[, "APOE4.status"])
+```
+
+> **Read that second table before reading any APOE4 result.** Every APOE4-positive
+> donor in this cohort is in the AD group; the non-AD group is entirely
+> APOE4-negative. The design is still full rank — the AD group contains both
+> genotypes, so the coefficient is estimable — but it is estimated **only from
+> the within-AD contrast**. This is not a bug in the data; it is what APOE4 does,
+> since carrying the allele is a major risk factor for having AD pathology at
+> autopsy. It does mean that "adjusting for APOE4 status" here is doing something
+> narrower than it sounds, and that a headline APOE4 effect from this design would
+> need to be described very carefully. A design matrix check would not have caught
+> it. A two-way table did.
+
+# Looking at the data before testing it
+
+```{r build_dds}
+dds <- DESeq2::DESeqDataSetFromMatrix(countData = mat_pseudobulk,
+                                      colData = metadata_pseudobulk,
+                                      design = design_formula)
+dds
+```
+
+## Why the counts need transforming first
+
+Every plot in this section is really a statement about **distance between
+donors** — a correlation, a PCA. Distances are only meaningful if every gene gets
+a comparable say in them, and on the raw count scale they do not. Count data is
+heteroskedastic: a gene averaging 5,000 counts has a variance in the thousands, a
+gene averaging 5 counts has a variance around 5. Correlate two donors on raw
+counts and the answer is decided almost entirely by the few hundred loudest
+genes.
+
+The obvious fix, `log(x + 1)`, overcorrects at the other end. Down where a gene
+has 1 count in one donor and 4 in another, that is pure sampling noise, but on
+the log scale it is a two-fold change — as large a move as anything the highly
+expressed genes make. Log-transformed data is dominated by its quietest, least
+reliable genes.
+
+A **variance-stabilizing transform** fits the actual mean–variance relationship
+in *your* data and applies the transformation that flattens it, so that variance
+is roughly constant across the whole expression range. High-count genes get
+compressed, low-count genes get shrunk toward the gene's overall mean rather than
+inflated. After it, a difference of 0.5 means about the same amount of evidence
+whether the gene is loud or quiet, and a correlation between two donors is a
+statement about their transcriptomes rather than about their sequencing depth.
+
+`vst()` and `rlog()` are DESeq2's two implementations of that idea and are
+interchangeable in what they are for. `vst()` fits a parametric curve to the
+dispersion trend and is fast; `rlog()` shrinks each gene individually and handles
+small experiments and wildly varying library sizes better, at a cost that grows
+badly with sample size. DESeq2's own advice is `rlog()` below roughly 30 samples
+and `vst()` above, and we have `r ncol(mat_pseudobulk)`.
+
+```{r vst}
+vsd <- DESeq2::vst(dds, blind = TRUE)
+```
+
+`blind = TRUE` matters: it tells the transform to ignore the design, so the
+picture you are about to look at is not shaped by the hypothesis you are about to
+test.
+
+## What to look for in the correlation heatmap
+
+```{r sample_correlation, fig.width=8, fig.height=7, cache=FALSE}
+vsd_mat <- SummarizedExperiment::assay(vsd)
+cor_mat <- cor(vsd_mat)
+
+annotation_df <- data.frame(ADNC = metadata_pseudobulk[, "ADNC"],
+                            sex = metadata_pseudobulk[, "sex"],
+                            row.names = rownames(metadata_pseudobulk))
+
+pheatmap::pheatmap(cor_mat,
+                   annotation_col = annotation_df,
+                   show_rownames = FALSE,
+                   show_colnames = FALSE,
+                   main = "Pseudobulk sample-sample correlation")
+```
+
+An 80 × 80 grid of colour is not something to judge by eye, so put numbers on the
+same questions first.
+
+```{r correlation_numbers, cache=FALSE}
+cor_offdiag <- cor_mat[lower.tri(cor_mat)]
+round(quantile(cor_offdiag, c(0, 0.05, 0.5, 0.95, 1)), 3)
+
+mean_cor <- (rowSums(cor_mat) - 1) / (ncol(cor_mat) - 1)
+round(sort(mean_cor)[1:5], 3)
+
+metadata_pseudobulk[names(sort(mean_cor)[1:5]), "n_cells"]
+
+cor(mean_cor, log10(metadata_pseudobulk[, "n_cells"]))
+```
+
+Now the plot. There are four things worth looking for in it, and the reason to
+name them is that a heatmap like this gets printed far more often than it gets
+read.
+
+**One: the overall level.** Every column is the same cell type from the same
+brain region, so these profiles ought to be very similar to one another, and they
+are — the middle 90% of the off-diagonal correlations run from
+`r round(quantile(cor_offdiag, 0.05), 2)` to
+`r round(quantile(cor_offdiag, 0.95), 2)`. A version of this plot centred on 0.3
+would not be telling you which donors differ; it would be telling you something
+broke upstream. This is a *did anything go wrong* plot before it is anything
+else.
+
+**Two: individual samples that sit apart from everything.** These are what the
+plot is best at. Look for a row and column that is uniformly cooler than the rest
+of the grid, rather than for pairs — a donor that correlates poorly with the
+whole cohort is a candidate to exclude; two donors that correlate poorly with
+each other but fine with everyone else are just two donors. Three samples on the
+left edge of this grid stand off from the rest, and `mean_cor` gives you their
+names — around 0.83 average correlation against a cohort median of 0.92 — instead
+of making you count squares. Finding them now matters because DESeq2 will not
+mention them later: it estimates one dispersion per gene pooled across all
+donors, so an aberrant donor widens that estimate and quietly costs power for
+every gene in the experiment.
+
+**Three: whether the block structure lines up with the annotation bars.** This is
+the one people expect to be the payoff, and it usually is not. If AD and non-AD
+pseudobulk profiles were fundamentally different, the `ADNC` bar would sort into
+two blocks along the dendrogram. It does not — the green and red squares are
+interleaved all the way across, and so are the sexes. That is the ordinary
+outcome for a disease contrast in brain tissue, and it is worth absorbing before
+reading a single p-value: whatever separates these donors most strongly, disease
+status is not it. The variance decomposition at the end of this tutorial puts a
+number on that; the heatmap gets you there for free in one line.
+
+**Four: whether it lines up with something you did not want.** The structure that
+*is* here — a dense, highly correlated core with paler samples trailing off it —
+has to come from somewhere, and the usual suspects are technical: sequencing
+depth, cells per donor, batch, PMI, RNA quality. Correlating each donor's average
+correlation against its cell count is the cheap version of that check, and here
+it comes back at **0.78**. That is the honest reading of this heatmap: it is
+substantially a picture of how many nuclei each donor contributed. The three
+samples flagged above are the three thinnest in the cohort, and a donor built
+from few nuclei is *noisy*, not *strange* — which changes what you would do about
+it, since excluding it is a decision about precision rather than about sample
+quality.
+
+> **Low correlation and outlying position are not the same thing.** PC1 of the
+> same matrix, two plots down, correlates with that same cell count at only 0.19.
+> There is no contradiction: sampling noise from a thin pseudobulk column is
+> spread across all genes at once, which pulls that sample away from *everything*
+> without pushing it in any particular direction. A correlation heatmap sees that
+> and a PCA largely does not. It is a decent argument for looking at both, which
+> is what the next two plots are for.
+
+## The same questions, in a PCA
+
+```{r pca_plot, fig.width=7, fig.height=5, cache=FALSE}
+gg <- DESeq2::plotPCA(vsd, intgroup = "ADNC") +
+  ggplot2::ggtitle("Pseudobulk PCA, coloured by ADNC")
+plot(gg)
+```
+
+```{r pca_plot_ncells, fig.width=7, fig.height=5, cache=FALSE}
+pca_df <- DESeq2::plotPCA(vsd, intgroup = "ADNC", returnData = TRUE)
+pca_df[, "n_cells"] <- metadata_pseudobulk[, "n_cells"]
+
+gg <- ggplot2::ggplot(pca_df, ggplot2::aes(x = PC1, y = PC2)) +
+  ggplot2::geom_point(ggplot2::aes(colour = n_cells), size = 3) +
+  ggplot2::scale_colour_viridis_c(trans = "log10") +
+  ggplot2::ggtitle("The same PCA, coloured by cells per donor")
+plot(gg)
+```
+
+Those two plots are the same points twice, and comparing them is the point: if
+donors separate by how many cells they contributed rather than by their
+pathology, the leading variation in your pseudobulk is a depth artifact and the
+gene list will be about depth too.
+
+Do not settle it by eye. Correlate the components against both.
+
+```{r pca_correlations}
+cor(pca_df[, "PC1"], log10(pca_df[, "n_cells"]))
+cor(pca_df[, "PC2"], log10(pca_df[, "n_cells"]))
+
+summary(aov(pca_df[, "PC1"] ~ metadata_pseudobulk[, "ADNC"]))
+```
+
+Here PC1 correlates with depth at 0.19 and separates the ADNC groups at
+`p = 0.056` — so neither the artifact nor the biology dominates the leading
+component. That is a mildly reassuring answer, and the reason to run the
+check is that the alternative answers are the ones that would have changed what
+you do next.
+
+# Testing
+
+```{r run_deseq}
+dds <- DESeq2::DESeq(dds)
+DESeq2::resultsNames(dds)
+```
+
+`resultsNames()` is worth reading rather than assuming. Each name is a coefficient
+in the fitted model, and the one you want is spelled out in
+`variable_level_vs_reference` form — evidence that `relevel()` did what you
+intended.
+
+```{r results}
+deseq2_res <- DESeq2::results(dds, name = "ADNC_AD_vs_NonAD")
+summary(deseq2_res)
+```
+
+```{r results_head}
+deseq2_res_ordered <- deseq2_res[order(deseq2_res$padj), ]
+head(as.data.frame(deseq2_res_ordered), 10)
+```
+
+## Shrinking the fold changes
+
+A gene with few counts can post a huge fold change on almost no evidence: 3
+counts in the non-AD donors against 30 in the AD donors is a ten-fold change, and
+it is also nothing at all. Ranking by raw `log2FoldChange` puts genes like that
+at the top of the table, above genes measured in the thousands that moved by a
+solid and believable 40%.
+
+`lfcShrink()` is the standard answer to that. It fits a prior to the distribution
+of effect sizes across all genes and reports each gene's fold change under that
+prior. A gene with thousands of counts has a tight likelihood and barely moves; a
+gene with a handful has a wide one and gets pulled toward zero, because the data
+never had much to say about it. `type = "apeglm"` is the current recommended
+estimator; note it requires `coef =` naming a coefficient from
+`resultsNames()` and will not take an arbitrary `contrast =`.
+
+```{r shrink}
+deseq2_shrunk <- DESeq2::lfcShrink(dds,
+                                   coef = "ADNC_AD_vs_NonAD",
+                                   type = "apeglm")
+head(as.data.frame(deseq2_shrunk[order(deseq2_shrunk$padj), ]), 10)
+```
+
+```{r ma_plots, fig.width=9, fig.height=4.5, cache=FALSE}
+par(mfrow = c(1, 2))
+DESeq2::plotMA(deseq2_res, ylim = c(-3, 3), main = "Unshrunk")
+DESeq2::plotMA(deseq2_shrunk, ylim = c(-3, 3), main = "Shrunk (apeglm)")
+par(mfrow = c(1, 1))
+```
+
+The two panels are the same genes, and the difference between them is the whole
+point. On the left, the low-count end of the axis is a wide fan: genes averaging
+5 to 50 counts reaching a log2 fold change of ±2, none of them significant, all
+of them ahead of the real hits if you sort by effect size. On the right that fan
+has collapsed onto the zero line, while the blue significant genes — which sit at
+means of a few hundred — have barely moved.
+
+> **Yes, this is standard, and if you have not seen it, here is the likely
+> reason.** Shrunken fold changes are what the DESeq2 vignette recommends for MA
+> plots, volcano plots, and any ranking or thresholding of genes by effect size.
+> They used to be automatic: until DESeq2 1.16, `results()` applied the shrinkage
+> itself by default (`betaPrior = TRUE`), so a great deal of published work and
+> a great many older tutorials report shrunken fold changes without ever
+> mentioning it. That default was pulled out into a separate `lfcShrink()` call
+> so that the *estimate* you report and the *test* you report stay visibly
+> separate steps — which is clearer, at the cost that you now have to know the
+> step exists. Reporting unshrunk fold changes is not an error, and plenty of
+> papers do; it just means a six-fold change in your table may be one
+> lightly-observed gene.
+
+The p-values are identical between the two — shrinkage changes the effect size
+estimate, not the test. Use the unshrunk table to decide *what is significant*,
+and the shrunk one to decide *what is large*. That division is also why the GSEA
+at the end of this tutorial ranks on the Wald statistic from the unshrunk
+results: the statistic already carries the same information shrinkage adds, in
+that it divides each fold change by its own standard error.
+
+```{r volcano, fig.width=9, fig.height=7, cache=FALSE}
+gg <- EnhancedVolcano::EnhancedVolcano(
+  deseq2_shrunk,
+  lab = rownames(deseq2_shrunk),
+  x = "log2FoldChange",
+  y = "pvalue",
+  pCutoff = 0.05,
+  FCcutoff = 0.25,
+  title = "Micro-PVM_2, AD vs non-AD",
+  subtitle = "Pseudobulk by donor, adjusted for sex and APOE4 status")
+plot(gg)
+```
+
+> **The volcano's y-axis is the raw p-value, and its cutoff line is drawn at a
+> raw p-value too.** That is the package default and it is not the threshold you
+> should report. Read significance off `padj`.
+
+# Interrogating the answer
+
+You now have a ranked gene list, and the temptation is to go straight from here
+to a volcano plot to a slide. **The step that gets skipped is reading the gene
+names.** It is easy to skip precisely because nothing prompts you to do it: the
+table is sorted, the p-values are small, the volcano looks like a volcano, and
+the output of `results()` gives no sign that anything is amiss. Sorting a column
+is not the same as looking at what is in it. So before this becomes a figure,
+read the top twenty genes and ask whether they have something in common that has
+nothing to do with your hypothesis.
+
+```{r top_genes}
+top_genes <- rownames(deseq2_res_ordered)[1:20]
+top_genes
+
+sum(grepl("^MT-", top_genes))
+```
+
+Seven of the top ten genes, and eight of the top twenty, are mitochondrial. That
+should stop you, because **these are nuclei**. A nucleus does not contain
+mitochondria, so mitochondrial transcripts in a snRNA-seq count matrix are
+ambient RNA — soup from lysed cells captured alongside the nucleus. Week 2 made
+this point in the other direction — the ambient contamination fraction in nuclei
+can be *estimated from* the mitochondrial genes, precisely because their true
+expression is known to be zero.
+
+So the strongest "AD versus non-AD" signal in this analysis is a candidate
+artifact: if AD samples carry more ambient RNA — because of tissue quality, PMI,
+dissociation, or anything else that differs systematically — then every
+mitochondrial gene will come out higher in AD, with no biology involved.
+
+Test it directly. The mitochondrial fraction is a per-donor quantity, so compute
+it on the pseudobulk.
+
+```{r mito_fraction}
+mito_genes <- grep("^MT-", rownames(mat_pseudobulk), value = TRUE)
+mito_genes
+
+mito_fraction <- Matrix::colSums(mat_pseudobulk[mito_genes, ]) /
+  Matrix::colSums(mat_pseudobulk)
+metadata_pseudobulk[, "mito_fraction"] <- mito_fraction
+
+summary(mito_fraction)
+tapply(mito_fraction, metadata_pseudobulk[, "ADNC"], summary)
+```
+
+```{r mito_test}
+wilcox.test(mito_fraction ~ metadata_pseudobulk[, "ADNC"])
+```
+
+```{r mito_plot, fig.width=6, fig.height=4.5, cache=FALSE}
+plot_df <- data.frame(mito_fraction = mito_fraction,
+                      ADNC = metadata_pseudobulk[, "ADNC"])
+
+gg <- ggplot2::ggplot(plot_df,
+                      ggplot2::aes(x = ADNC, y = mito_fraction)) +
+  ggplot2::geom_boxplot(outlier.shape = NA) +
+  ggplot2::geom_jitter(width = 0.15, alpha = 0.6) +
+  ggplot2::labs(y = "Mitochondrial fraction of pseudobulk counts",
+                title = "Ambient contamination is not balanced across groups") +
+  ggplot2::theme_bw()
+plot(gg)
+```
+
+The contamination is real and it is not balanced: the AD group's median
+mitochondrial fraction is roughly double the non-AD group's (0.21% against
+0.12%), and the difference survives a rank test at `p = 0.003`.
+
+The plot adds something the medians do not. The two groups overlap almost
+completely at the bottom; what separates them is a **tail of about a dozen AD
+donors** running up to 1.4%, with no non-AD counterpart above 0.32%. So this is
+not "AD samples are uniformly dirtier" — it is a subset of AD samples that are,
+and they are enough to move a group mean. That distinction matters for what you
+would do about it: a covariate treats it as a smooth gradient, whereas the
+picture suggests a handful of samples you might simply exclude and re-run.
+
+Put it in the model as a covariate and re-test.
+
+```{r deseq_adjusted}
+dds_adj <- DESeq2::DESeqDataSetFromMatrix(
+  countData = mat_pseudobulk,
+  colData = metadata_pseudobulk,
+  design = ~ sex + APOE4.status + mito_fraction + ADNC)
+
+dds_adj <- DESeq2::DESeq(dds_adj)
+DESeq2::resultsNames(dds_adj)
+
+deseq2_res_adj <- DESeq2::results(dds_adj, name = "ADNC_AD_vs_NonAD")
+summary(deseq2_res_adj)
+```
+
+```{r compare_adjusted}
+deseq2_res_adj_ordered <- deseq2_res_adj[order(deseq2_res_adj$padj), ]
+head(as.data.frame(deseq2_res_adj_ordered), 10)
+
+sum(deseq2_res$padj < 0.05, na.rm = TRUE)
+sum(deseq2_res_adj$padj < 0.05, na.rm = TRUE)
+
+sum(grepl("^MT-", rownames(deseq2_res_adj_ordered)[1:20]))
+```
+
+**The adjustment did not do what you might expect, and that is worth sitting
+with.** Overall the result shrinks hard — 20 genes at `padj < 0.05` become 5, and
+the count at `padj < 0.1` falls from 50 to 14 — so the covariate is absorbing a
+lot. But the mitochondrial genes are still eight of the top twenty and still at
+the very top; `MT-ND3` moves from `padj = 0.013` to `padj = 0.041` and stays
+first. Adding the covariate weakened the evidence without reassigning the
+ranking.
+
+> **Why this particular adjustment cannot settle it.** `mito_fraction` is
+> computed *from the mitochondrial genes themselves*. For every other gene it is
+> a legitimate technical covariate; for `MT-ND3` it is very nearly the outcome,
+> so regressing one on the other is close to circular and the coefficient is not
+> interpretable as "the AD effect net of contamination." A cleaner design would
+> use a contamination estimate derived independently — SoupX's `rho` from Week 2,
+> or an ambient profile estimated from empty droplets — and that requires going
+> back to raw CellRanger output this object no longer carries.
+
+> **What to take from this, and what not to.** We have not shown the
+> mitochondrial signal is artefactual. We have shown three things: the ambient
+> fraction differs by group, the top of the gene list is entirely composed of
+> genes that ambient contamination would move, and the data in hand **cannot
+> separate** the two explanations. That is a real result and it belongs in the
+> methods section. It is also completely invisible unless someone reads the gene
+> names.
+>
+> The general habit: when a DE result is topped by a coherent block of genes that
+> share a mechanism unrelated to your hypothesis — mitochondrial, ribosomal,
+> heat-shock, sex-chromosome, haemoglobin — treat that as a diagnostic finding
+> about your samples before treating it as a finding about your biology.
+
+The genes that are *not* mitochondrial are the ones to carry forward. `FKBP5`,
+`TLN2`, `PRKCA` and `TXNIP` survive in both versions of the model, and `FKBP5` in
+particular is a well-studied stress-response gene with an existing AD literature —
+which makes it a hypothesis, not a conclusion.
+
+# Why this had to be pseudobulk
+
+Everything above can be done the other way — test the cells directly, ignoring
+which donor they came from. That is one line, so let us run it and compare.
+
+```{r single_cell_de}
+Seurat::Idents(seurat_obj) <- "ADNC"
+adnc_binary <- rep("NonAD", ncol(seurat_obj))
+adnc_binary[seurat_obj$ADNC %in% c("High", "Intermediate")] <- "AD"
+seurat_obj$adnc_binary <- adnc_binary
+Seurat::Idents(seurat_obj) <- "adnc_binary"
+
+cell_level_res <- Seurat::FindMarkers(seurat_obj,
+                                      ident.1 = "AD",
+                                      ident.2 = "NonAD",
+                                      test.use = "wilcox",
+                                      logfc.threshold = 0,
+                                      min.pct = 0.1)
+head(cell_level_res, 5)
+```
+
+```{r compare_counts}
+sum(cell_level_res$p_val_adj < 0.05, na.rm = TRUE)
+sum(deseq2_res$padj < 0.05, na.rm = TRUE)
+
+min(cell_level_res$p_val, na.rm = TRUE)
+min(deseq2_res$pvalue, na.rm = TRUE)
+```
+
+**887 genes versus 20.** The smallest cell-level p-value is `1.9e-269`; the
+smallest pseudobulk p-value is `2.5e-08`. That is 261 orders of magnitude of
+apparent evidence produced entirely by changing what you call a replicate — the
+counts, the genes, and the donors are identical in the two analyses.
+
+Note also that the cell-level top table is led by the same mitochondrial genes,
+which is a useful reminder that pseudo-replication and confounding are separate
+problems: fixing one does not fix the other.
+
+```{r compare_scatter, fig.width=7, fig.height=5.5, cache=FALSE}
+shared_genes <- intersect(rownames(cell_level_res), rownames(deseq2_res))
+length(shared_genes)
+
+compare_df <- data.frame(
+  gene = shared_genes,
+  cell_level = -log10(cell_level_res[shared_genes, "p_val"] + 1e-300),
+  pseudobulk = -log10(deseq2_res[shared_genes, "pvalue"]))
+
+gg <- ggplot2::ggplot(compare_df,
+                      ggplot2::aes(x = pseudobulk, y = cell_level)) +
+  ggplot2::geom_point(alpha = 0.2, size = 0.6) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, colour = "red") +
+  ggplot2::labs(x = "-log10 p, pseudobulk (donors as replicates)",
+                y = "-log10 p, cell-level Wilcoxon (cells as replicates)",
+                title = "The same genes, the same data, two definitions of n") +
+  ggplot2::theme_bw()
+plot(gg)
+```
+
+The red line is `y = x`, where the two tests would agree. Essentially every gene
+sits above it, and the line is pressed flat against the bottom of the panel
+because the two axes differ by roughly two orders of magnitude: the pseudobulk
+`-log10 p` tops out near 8, the cell-level one runs past 250. That whole vertical
+gap is pseudo-replication.
+
+> **This is not an argument that cell-level tests are always wrong.** They are
+> the right tool for the question in the companion tutorial — what distinguishes
+> one cluster of cells from another — where cells genuinely are the units. The
+> error is using them for a question about donors. Mixed models that keep cells
+> as observations while modelling donor as a random effect are a third option and
+> a real area of method development.
+
+# How much of the variation is what you care about?
+
+Before reading a gene list, it is worth asking how much of the expression
+variation in this dataset any of these variables explains. `variancePartition`
+answers that per gene.
+
+```{r variance_partition}
+varpart_formula <- ~ ADNC + sex + APOE4.status + mito_fraction + n_cells
+
+vsd_mat_top <- vsd_mat[order(apply(vsd_mat, 1, var),
+                             decreasing = TRUE)[1:2000], ]
+
+varpart_res <- variancePartition::fitExtractVarPartModel(
+  vsd_mat_top, varpart_formula, metadata_pseudobulk)
+
+head(variancePartition::sortCols(varpart_res))
+```
+
+> **Fixed effects or random effects is not a formatting choice here.** The
+> formula above declares every variable as a fixed effect, and that decision is
+> load-bearing. Written instead as `~ (1 | sex) + (1 | ADNC) + ...`, every
+> categorical variable becomes a random effect — and a random effect estimated
+> from **two** levels has almost no information about its own variance, so the
+> fitted variance component collapses to zero. Run this analysis that way and
+> `XIST`, a gene expressed
+> almost exclusively in females, comes back with sex explaining ~0% of its
+> variance and residual ~100%. The result is not flagged; it just looks like a
+> null. `variancePartition`'s own guidance is to model categorical variables with
+> few levels as **fixed** effects and reserve random effects for variables with
+> many levels — donor in a repeated-measures design, batch across dozens of runs.
+
+The sanity check is right there in the output: the most variable genes in this
+pseudobulk are sex-chromosome and X-inactivation genes, so `sex` had better
+account for nearly all of their variance.
+
+```{r variance_partition_check}
+sex_genes <- intersect(c("XIST", "UTY", "USP9Y", "RPS4Y1", "DDX3Y", "KDM5D"),
+                       rownames(varpart_res))
+varpart_res[sex_genes, ]
+```
+
+```{r variance_partition_plot, fig.width=7, fig.height=5, cache=FALSE}
+gg <- variancePartition::plotVarPart(variancePartition::sortCols(varpart_res)) +
+  ggplot2::ggtitle("Variance explained per gene, 2000 most variable")
+plot(gg)
+```
+
+```{r variance_partition_summary}
+round(100 * colMeans(varpart_res), 2)
+round(100 * apply(varpart_res, 2, median), 2)
+```
+
+Two things to read off this.
+
+**`Residuals` is the tallest box**, at 81% on average. Most of the gene-to-gene
+variation between donors is not explained by any label we have, which is the
+honest headline and a useful calibration before reading any gene list.
+
+**And the ordering of the rest is the finding.** Averaged over the 2,000 most
+variable genes: `mito_fraction` **11.0%**, `n_cells` 3.6%, `sex` 2.0%, `ADNC`
+**1.2%**, `APOE4.status` 1.0%. The ambient-contamination covariate explains
+roughly **nine times** as much variance as the disease variable this whole
+analysis is about. The tall spike in the `sex` column is the sanity check
+working — a handful of sex-chromosome genes at nearly 100%, and almost nothing
+else.
+
+That is the same conclusion the mitochondrial section reached, arrived at
+independently and without reference to any p-value. It does not mean there is no
+AD signal; it means the AD signal is small relative to a technical one, which is
+exactly the situation where analysis choices decide the answer.
+
+# What do the genes do?
+
+A ranked gene list is not a finding. Gene set enrichment analysis asks whether
+genes belonging to a known biological process sit systematically high or low in
+your ranking.
+
+The ranking statistic is a choice. Ranking by shrunk log fold change asks "what
+changed most"; ranking by the Wald statistic asks "what changed most relative to
+its uncertainty", which folds in how well each gene was measured.
+
+```{r gsea_ranking}
+teststat_vec <- deseq2_res[, "stat"]
+names(teststat_vec) <- rownames(deseq2_res)
+teststat_vec <- teststat_vec[!is.na(teststat_vec)]
+teststat_vec <- sort(teststat_vec, decreasing = TRUE)
+
+length(teststat_vec)
+head(teststat_vec)
+tail(teststat_vec)
+```
+
+```{r unmapped_ids}
+sum(grepl("^ENSG", names(teststat_vec)))
+```
+
+> **Not every row name is a gene symbol.** This matrix mixes HGNC symbols with
+> bare Ensembl IDs for features that had no symbol at annotation time — and two
+> of them sit in the top five of the ranking. Passing `keyType = "SYMBOL"` means
+> `gseGO()` silently drops every one of them. That is the right behaviour, but
+> "silently" is the operative word: nothing tells you how much of your ranked list
+> was discarded before the enrichment was computed. Count them yourself.
+
+> **GSEA is randomized, and its p-values move between runs unless you say
+> otherwise.** `gseGO()` takes a `seed` argument that is `FALSE` by default, so
+> the permutation p-values shift a little every time you run it. Passing
+> `seed = TRUE` is enough to fix that. We check that claim rather than trusting
+> it, two chunks down.
+
+```{r gsea}
+gse <- clusterProfiler::gseGO(teststat_vec,
+                              ont = "BP",
+                              keyType = "SYMBOL",
+                              OrgDb = "org.Hs.eg.db",
+                              minGSSize = 10,
+                              maxGSSize = 500,
+                              seed = TRUE,
+                              verbose = FALSE)
+
+gse_df <- as.data.frame(gse)
+dim(gse_df)
+head(gse_df[, c("Description", "setSize", "NES", "pvalue", "p.adjust")], 10)
+```
+
+```{r gsea_reproducible}
+gse_again <- clusterProfiler::gseGO(teststat_vec,
+                                    ont = "BP",
+                                    keyType = "SYMBOL",
+                                    OrgDb = "org.Hs.eg.db",
+                                    minGSSize = 10,
+                                    maxGSSize = 500,
+                                    seed = TRUE,
+                                    verbose = FALSE)
+
+identical(as.data.frame(gse_again)$pvalue, gse_df$pvalue)
+```
+
+```{r gsea_dotplot, fig.width=9, fig.height=7, cache=FALSE}
+gg <- enrichplot::dotplot(gse, showCategory = 15) +
+  ggplot2::ggtitle("GO biological process, ranked by Wald statistic")
+plot(gg)
+```
+
+A positive normalized enrichment score means the set sits toward the AD end of the
+ranking; negative means the non-AD end.
+
+Read the top ten and notice what is in it. `regulation of hemopoiesis` and
+`regulation of leukocyte differentiation` come out positive — those are myeloid
+processes and microglia are myeloid cells, so that is coherent. But
+`modulation of chemical synaptic transmission`, `regulation of trans-synaptic
+signaling`, `axon development`, `axonogenesis` and
+`cell morphogenesis involved in neuron differentiation` are all strongly
+**negative**, and this dataset contains nothing but microglia.
+
+> **Neuronal gene sets in a purely microglial analysis are a contamination
+> readout, not a discovery.** Microglia sit in a dense neuropil; ambient RNA in
+> cortical snRNA-seq is dominated by neuronal transcripts. Their coordinated
+> movement across the ranking tells you how much neuronal soup each group's
+> libraries carried. It is the same phenomenon as the mitochondrial block above,
+> arriving through a different door — and GSEA is *especially* prone to surfacing
+> it, because ambient RNA moves whole functional modules together, which is
+> exactly the pattern GSEA is built to detect.
+
+```{r gsea_split, fig.width=10, fig.height=8, cache=FALSE}
+gg <- enrichplot::dotplot(gse, showCategory = 10, split = ".sign") +
+  ggplot2::facet_grid(. ~ .sign)
+plot(gg)
+```
+
+> **GSEA is testing thousands of overlapping gene sets.** GO terms are nested —
+> a parent term contains its children — so a single real signal produces a column
+> of related, individually "significant" rows. Read the top of the table as one
+> finding with several names, not as several findings.
+
+# What we glossed over
+
+- **We never decontaminated.** This object ships as counts; no SoupX correction
+  was applied, which is why the ambient signal is so visible in the results. The
+  **Week 2** tutorials cover the correction, and the honest workflow runs it
+  before any of this. Doing it here would need the raw droplet matrices, which
+  this object does not carry.
+- **Which cell state to test.** We took `Micro-PVM_2` because it was the only
+  supertype present in nearly every donor. The companion Week 4 tutorial derives
+  clusters from scratch; testing those instead makes the DE result depend on a
+  clustering resolution, and that dependence is real and rarely reported.
+- **Cells as replicates *and* donors as a random effect.** Mixed models
+  (`glmmTMB`, `NEBULA`, `muscat`) sit between the two extremes shown here. They
+  are the current research frontier and not settled enough to teach as a default.
+- **Ordinal pathology.** We binarized ADNC. Braak stage, Thal phase, CERAD score
+  and SEA-AD's `Continuous.Pseudo.progression.Score` are all in the metadata and
+  all ordered.
+- **Compositional change.** If AD brains have proportionally fewer homeostatic
+  microglia, that is a finding — and it is invisible to this analysis, which
+  tests within a fixed cell type. Cell-type proportions are their own question,
+  touched on in the companion tutorial.
+- **Batch correction and DE.** We avoided the question by taking one chemistry.
+  Testing genes on integrated data is genuinely delicate: integration alters a
+  reduction, not counts, so DE should return to raw counts — which is exactly
+  what pseudobulk does. Batch belongs in the design formula, not in the counts.
+- **Multiple testing across clusters.** Run this for eight supertypes and you
+  have done eight families of tests. Nothing here adjusts for that.
+- **Over-representation analysis versus GSEA.** We ran GSEA on the full ranking.
+  Taking the significant genes and running a Fisher test against GO
+  (`enrichGO()`) is the other standard approach; it needs a threshold and it
+  discards the ranking.
+
+# References
+
+- Love MI, Huber W, Anders S (2014). "Moderated estimation of fold change and
+  dispersion for RNA-seq data with DESeq2." *Genome Biology* 15:550.
+  [doi:10.1186/s13059-014-0550-8](https://doi.org/10.1186/s13059-014-0550-8)
+- Zhu A, Ibrahim JG, Love MI (2019). "Heavy-tailed prior distributions for
+  sequence count data" (`apeglm`). *Bioinformatics* 35:2084–2092.
+  [doi:10.1093/bioinformatics/bty895](https://doi.org/10.1093/bioinformatics/bty895)
+- Squair JW *et al.* (2021). "Confronting false discoveries in single-cell
+  differential expression." *Nature Communications* 12:5692.
+  [doi:10.1038/s41467-021-25960-2](https://doi.org/10.1038/s41467-021-25960-2)
+  — the paper behind the pseudo-replication section.
+- Hoffman GE, Schadt EE (2016). "variancePartition." *BMC Bioinformatics* 17:483.
+  [doi:10.1186/s12859-016-1323-z](https://doi.org/10.1186/s12859-016-1323-z)
+- Subramanian A *et al.* (2005). "Gene set enrichment analysis." *PNAS*
+  102:15545–15550.
+  [doi:10.1073/pnas.0506580102](https://doi.org/10.1073/pnas.0506580102)
+- Prater KE, Lin KZ (2025). "All the single cells: single-cell
+  transcriptomics/epigenomics experimental design and analysis considerations for
+  glial biologists." *Glia* 73:451–473.
+  [doi:10.1002/glia.24633](https://doi.org/10.1002/glia.24633)
+- Gabitto MI *et al.* (2024). "Integrated multimodal cell atlas of Alzheimer's
+  disease" (SEA-AD). *Nature Neuroscience*.
+  [https://portal.brain-map.org/explore/seattle-alzheimers-disease](https://portal.brain-map.org/explore/seattle-alzheimers-disease)

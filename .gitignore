@@ -1,0 +1,54 @@
+# .gitignore for the public/ workshop-material repo
+#   (github.com/linnykos/ADRC_workshop_2026)
+#
+# NOTE: public/ is its own git repository. The .gitignore at the parent
+# ADRC_workshop_2026/ level does NOT apply here -- keep the two in sync by hand.
+
+# --- knitr build artifacts ---
+# Knitting a tutorial with `cache = TRUE` produces <name>_cache/ (the chunk cache)
+# and <name>_files/ (extracted figures). The Week 4 caches alone are ~4.6 GB, because
+# every chunk that modifies the 40k-nucleus Seurat object re-saves the whole thing.
+# These patterns have no leading slash, so they match at ANY depth -- every current
+# and future Week[N]_*/ directory is covered with no further edits.
+*_cache/
+*_files/
+
+# --- data ---
+# Tutorial data is downloaded at runtime into tempdir() (e.g. seaad_microglia.RData,
+# 525 MB), never committed. GitHub rejects pushes over 100 MB per file anyway.
+*.RData
+*.rda
+*.rds
+*.RDS
+*.h5ad
+*.h5
+*.loom
+*.mtx
+*.mtx.gz
+data/
+
+# --- R ---
+.Rproj.user/
+.Rhistory
+.Ruserdata
+*.Rproj
+.Rapp.history
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# --- OS / editor cruft ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+*~
+.*.swp
+.vscode/
+.idea/
