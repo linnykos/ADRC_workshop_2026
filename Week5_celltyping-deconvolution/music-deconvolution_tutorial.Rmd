@@ -1,0 +1,669 @@
+---
+title: "Week 5: Bulk deconvolution with MuSiC"
+author: "Kevin Z. Lin"
+date: "2026-08-24"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This tutorial was made from the MuSiC vignette,
+[https://xuranw.github.io/MuSiC/articles/MuSiC.html](https://xuranw.github.io/MuSiC/articles/MuSiC.html),
+and the method paper, Wang *et al.* (2019).
+
+Every week so far has started from single-cell data. This one starts from the
+opposite problem. You have **bulk** RNA-seq — one expression value per gene per
+sample, measured on a piece of tissue containing many cell types at once — and
+you want to know what was in the tissue.
+
+That question matters more than it sounds. Suppose you run bulk RNA-seq on
+cortex from cases and controls and find that a microglial gene goes up in cases.
+There are two completely different explanations:
+
+- every microglial cell is expressing more of that gene, or
+- there are simply **more microglia** in the case tissue, each expressing the
+  same amount.
+
+Bulk RNA-seq cannot tell these apart, and they mean different things
+biologically. **Deconvolution** is the attempt to recover the second quantity —
+the cell type proportions of each bulk sample — using single-cell data from the
+same tissue as a reference.
+
+**MuSiC** (MUlti-Subject SIngle Cell deconvolution) is one such method, and the
+one we use here. Its central idea is a weighting scheme, which we come back to
+in Section 8.
+
+> **Why we build the bulk data ourselves.** On real bulk data you never learn
+> whether the answer was right, because nobody counted the cells. So this
+> tutorial does the one thing that makes deconvolution learnable: we take
+> single-cell PBMC data, **add up** the counts of a known mixture of cells to
+> manufacture a bulk sample, and then check MuSiC's estimate against the mixture
+> we chose. Ten samples, exact ground truth, a number at the end that says how
+> close we got. This is the same benchmark design MuSiC's own paper uses.
+
+The plan:
+
+| Stage | What it produces | Function |
+|---|---|---|
+| 1. Pick a clean subset of cells | 2,816 cells with five cell type labels | `subset` on metadata |
+| 2. Split the cells in two | A reference half and a bulk half, sharing no cells | `sample()`, `setdiff()` |
+| 3. Manufacture bulk samples | A gene × 10 matrix of summed counts, plus the true proportions | `Matrix::rowSums()` |
+| 4. Package the reference | A `SingleCellExperiment`, the format MuSiC reads | `SingleCellExperiment()` |
+| 5. Deconvolve | Estimated proportions from MuSiC and from plain NNLS | `music_prop()` |
+| 6. Score against truth | RMSD, mean absolute deviation, correlation | `Eval_multi()` |
+| 7. Break it | The same run with a mismatched reference | `music_prop()` again |
+
+# Setting up
+
+MuSiC is not on CRAN or Bioconductor — it installs from GitHub. But it
+**depends** on `TOAST`, which is on Bioconductor, and a hard dependency is not
+fetched automatically by `install_github()`. Install `TOAST` first or the MuSiC
+install fails outright:
+
+```{r install}
+# if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install("TOAST")
+
+# install.packages("devtools")
+# devtools::install_github("xuranw/MuSiC")
+
+# devtools::install_github("satijalab/seurat-data")
+```
+
+`TOAST` itself is a package for cell-composition-aware differential expression;
+MuSiC borrows its machinery for the MuSiC2 extension mentioned at the end. You
+do not need to know anything about it to use MuSiC.
+
+```{r libraries}
+library(Seurat)
+library(SeuratData)
+library(SingleCellExperiment)
+library(MuSiC)
+library(ggplot2)
+```
+
+```{r clean_env}
+rm(list = ls())
+```
+
+# The data
+
+We reuse **pbmcsca**, the Ding *et al.* (2020) dataset from Week 3: peripheral
+blood mononuclear cells from two donors, profiled with seven technologies across
+nine batches.
+
+```{r install_data}
+# SeuratData::InstallData("pbmcsca")
+```
+
+```{r load_data}
+obj <- SeuratData::LoadData("pbmcsca")
+obj
+```
+
+We use it for a different reason than Week 3 did. There we wanted its batch
+effects; here we want its **`CellType` column** — the authors' own cell type
+calls, which will serve as our ground truth.
+
+```{r celltype_table}
+table(obj$CellType)
+```
+
+## Choosing which cell types to keep
+
+Ten labels, and they are wildly unbalanced: 9,071 cytotoxic T cells against 164
+plasmacytoid dendritic cells and 46 cells the authors could not assign.
+
+Deconvolution cannot estimate what it cannot see. A cell type present at 1% with
+164 cells to build a reference from will be estimated badly no matter which
+method you use, and including it makes the whole result harder to read. So we
+keep the five well-represented types and drop the rest:
+
+```{r select_ct}
+select_ct <- c("B cell", "CD14+ monocyte", "CD4+ T cell",
+               "Cytotoxic T cell", "Natural killer cell")
+```
+
+> **This is a real decision, not tidying.** By dropping the other five types we
+> have declared that our bulk samples contain *only* these five. That happens to
+> be true here because we build the bulk ourselves. On real bulk tissue it is
+> never true, and any cell type missing from your reference has its signal
+> pushed onto whichever reference cell type resembles it most. Section 9 has
+> more on this.
+
+## Restricting to one technology
+
+```{r subset_v3}
+keep_vec <- obj$Method == "10x Chromium (v3)" & obj$CellType %in% select_ct
+sum(keep_vec)
+
+count_mat     <- SeuratObject::LayerData(obj, assay = "RNA",
+                                         layer = "counts")[, keep_vec]
+cell_type_vec <- obj$CellType[keep_vec]
+dim(count_mat)
+table(cell_type_vec)
+```
+
+2,816 cells, all from the single 10x Chromium v3 run. Everything below — the
+reference *and* the bulk — comes from this one pool of cells.
+
+> **Why one technology, and why it matters so much.** Deconvolution assumes your
+> reference measures genes the same way your bulk data does. Holding the
+> technology fixed makes that assumption true by construction, which is what
+> lets the rest of this tutorial be about MuSiC rather than about batch effects.
+> It is also the single strongest assumption in the whole document. Section 9
+> deliberately violates it and shows the damage.
+
+# Splitting the cells into a reference half and a bulk half
+
+The cells that build the reference must not be the cells that build the bulk. If
+they were, we would be asking MuSiC to recognise cells it had already seen, and
+the answer would be flattering and meaningless.
+
+```{r split_cells}
+set.seed(1)
+ref_cell_vec  <- sample(colnames(count_mat), size = round(ncol(count_mat) / 2))
+pool_cell_vec <- setdiff(colnames(count_mat), ref_cell_vec)
+
+length(ref_cell_vec)
+length(pool_cell_vec)
+table(cell_type_vec[pool_cell_vec])
+```
+
+1,408 cells each way, with all five cell types on both sides — down to 102
+natural killer cells in the bulk pool, which is the smallest number anything
+here rests on.
+
+## The reference needs a notion of "subject"
+
+This is where MuSiC differs from simpler methods, and it needs explaining before
+the code makes sense.
+
+MuSiC does not just want an average expression profile per cell type. It wants
+to know **how reproducible** that profile is: for each gene and each cell type,
+how much does the value move around when you look at a different donor? Genes
+whose cell-type profile is stable across donors are trustworthy for
+deconvolution; genes that swing wildly are not. That is the cross-subject
+variance at the heart of the method, and it is why `music_prop()` has a
+`samples` argument at all.
+
+Our problem: this data has **one donor**. Every 10x v3 cell in `pbmcsca` came
+from the donor labelled `pbmc1`. So we split the reference cells into four
+groups at random and call them donors:
+
+```{r pseudo_donors}
+set.seed(2)
+donor_vec <- sample(paste0("donor", 1:4), size = length(ref_cell_vec),
+                    replace = TRUE)
+
+ref_meta_df <- data.frame(CellType  = cell_type_vec[ref_cell_vec],
+                          sample_id = donor_vec,
+                          row.names = ref_cell_vec)
+table(ref_meta_df$sample_id, ref_meta_df$CellType)
+```
+
+> **Be clear-eyed about what we just did.** These four "donors" are one donor's
+> cells shuffled into four piles. The variability MuSiC will measure across them
+> is sampling noise, not biological difference between people. That makes this a
+> *best case* — MuSiC's weights here are cleaner than anything you will get on
+> real data. We do it because `pbmcsca` gives us no alternative, and it is worth
+> knowing that this is the corner we cut. **On your own data, `samples` must be
+> your real biological subjects.** Never invent this column.
+
+## Packaging the reference
+
+MuSiC does not read Seurat objects. It reads a `SingleCellExperiment` — the
+Bioconductor container — and it looks for the raw counts in an assay named
+`counts` and for the labels in `colData`:
+
+```{r build_sce}
+sce_ref <- SingleCellExperiment::SingleCellExperiment(
+  assays  = list(counts = count_mat[, ref_cell_vec]),
+  colData = ref_meta_df)
+sce_ref
+```
+
+`colData names(2): CellType sample_id` — those two names are what we hand to
+`music_prop()` in a moment. Note that we passed **raw counts**, not normalized
+data. MuSiC does its own normalization internally; handing it log-normalized
+values would be wrong.
+
+# Manufacturing the bulk samples
+
+Now the synthetic part. We build 10 bulk samples, each a different mixture.
+
+First, decide how many cells of each type go into each sample. Drawing each
+count uniformly between 20 and 150 gives compositions that differ a lot from
+sample to sample, which is what we need — if all ten samples had the same
+composition there would be nothing for an estimate to track:
+
+```{r n_cell_mat}
+n_sample <- 10
+
+set.seed(10)
+n_cell_mat <- matrix(sample(20:150, size = n_sample * length(select_ct),
+                            replace = TRUE),
+                     nrow = n_sample, ncol = length(select_ct),
+                     dimnames = list(paste0("sample", 1:n_sample), select_ct))
+n_cell_mat
+rowSums(n_cell_mat)
+```
+
+Now draw those cells from the bulk half and add up their counts. Summing raw
+counts across cells is exactly what a bulk assay does — a bulk library is
+physically the pooled mRNA of all the cells in the tissue:
+
+```{r build_bulk}
+pool_count_mat <- count_mat[, pool_cell_vec]
+pool_ct_vec    <- cell_type_vec[pool_cell_vec]
+
+set.seed(10)
+bulk_mat <- sapply(rownames(n_cell_mat), function(sample_name) {
+  drawn_vec <- unlist(lapply(select_ct, function(ct) {
+    sample(pool_cell_vec[pool_ct_vec == ct],
+           size = n_cell_mat[sample_name, ct], replace = TRUE)
+  }))
+  Matrix::rowSums(pool_count_mat[, drawn_vec])
+})
+
+dim(bulk_mat)
+bulk_mat[1:5, 1:4]
+colSums(bulk_mat)
+```
+
+A gene × sample matrix of integer counts with libraries of 1.5 to 2.7 million —
+which is what a real bulk RNA-seq count matrix looks like. Nothing about
+`bulk_mat` remembers that it was made from single cells.
+
+Cells are drawn **with replacement**, so a cell can appear more than once in a
+sample and can appear in several samples. That is deliberate: only 102 natural
+killer cells are available and a sample may call for up to 150, and it also
+makes the ten samples independent draws from one population rather than a
+partition of a fixed pot.
+
+The truth we will be scoring against is just the cell counts, normalized:
+
+```{r prop_true}
+prop_true_mat <- n_cell_mat / rowSums(n_cell_mat)
+round(prop_true_mat, 3)
+```
+
+Proportions run from 0.064 to 0.475 — a wide enough spread to make a correlation
+meaningful.
+
+> **`MuSiC::bulk_construct()` does a version of this for you.** Give it a
+> `SingleCellExperiment` and a column naming which sample each cell belongs to,
+> and it sums each sample's cells and returns the true cell counts alongside.
+> We wrote the loop out instead because we needed to *choose* each sample's
+> composition, and `bulk_construct()` only pools whatever cells a sample already
+> has.
+
+# Running MuSiC
+
+One call. `clusters` names the cell type column, `samples` names the subject
+column, and `select.ct` restricts the answer to the cell types we care about:
+
+```{r music_prop, message=TRUE}
+music_res <- MuSiC::music_prop(bulk.mtx = bulk_mat, sc.sce = sce_ref,
+                               clusters = "CellType", samples = "sample_id",
+                               select.ct = select_ct)
+```
+
+The messages are worth reading rather than scrolling past. **18,013 common
+genes** is the intersection of the genes expressed in the bulk matrix and in the
+reference — MuSiC drops everything else, and if that number ever comes back
+small it means your gene identifiers do not match (Ensembl IDs against symbols
+is the usual culprit). The per-sample counts that follow are the non-zero genes
+in each bulk sample, which is what each sample's fit actually uses.
+
+```{r music_names}
+names(music_res)
+```
+
+Two of these are estimates and three are diagnostics:
+
+- `Est.prop.weighted` — **the MuSiC estimate**, sample × cell type.
+- `Est.prop.allgene` — plain non-negative least squares on the same data, with
+  every gene weighted equally. This is the comparison baseline, and it is free.
+- `Weight.gene` — the weight MuSiC gave each gene in each sample.
+- `r.squared.full` — how well the fitted mixture reproduces each bulk sample.
+- `Var.prop` — variance of the estimated proportions.
+
+```{r music_est}
+round(music_res$Est.prop.weighted, 3)
+```
+
+```{r music_rsq}
+round(music_res$r.squared.full, 4)
+```
+
+Every sample is fit at R² ≥ 0.9958. Hold on to that number — Section 9 is about
+what it looks like when this goes wrong.
+
+# Scoring the estimates against the truth
+
+`Eval_multi()` takes the true proportions and a list of estimates and returns
+three numbers per method: root-mean-square deviation, mean absolute deviation,
+and the correlation across all sample × cell type pairs.
+
+```{r eval_multi}
+eval_mat <- MuSiC::Eval_multi(prop.real = prop_true_mat,
+                              prop.est  = list(music_res$Est.prop.weighted,
+                                               music_res$Est.prop.allgene),
+                              method.name = c("MuSiC", "NNLS"))
+eval_mat
+```
+
+MuSiC lands at a mean absolute error of **0.013** — on a proportion, that is
+just over one percentage point — and a correlation of **0.980** with the truth.
+Plain NNLS, on identical inputs, gets 0.042 and 0.833. The weighting is worth
+roughly a factor of three in error.
+
+```{r scatter, fig.width=11, fig.height=3.5}
+plot_df <- data.frame(
+  truth     = c(prop_true_mat, prop_true_mat),
+  estimate  = c(music_res$Est.prop.weighted[, select_ct],
+                music_res$Est.prop.allgene[, select_ct]),
+  cell_type = factor(rep(rep(select_ct, each = n_sample), times = 2),
+                     levels = select_ct),
+  method    = factor(rep(c("MuSiC", "NNLS"),
+                         each = n_sample * length(select_ct)),
+                     levels = c("MuSiC", "NNLS")))
+
+gg <- ggplot2::ggplot(plot_df, ggplot2::aes(x = truth, y = estimate)) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, colour = "gray60",
+                       linetype = "dashed") +
+  ggplot2::geom_point(ggplot2::aes(colour = method), size = 2, alpha = 0.8) +
+  ggplot2::facet_wrap(~ cell_type, nrow = 1) +
+  ggplot2::coord_fixed(xlim = c(0, 0.55), ylim = c(0, 0.55)) +
+  ggplot2::labs(x = "True proportion", y = "Estimated proportion",
+                colour = "Method") +
+  ggplot2::theme_minimal()
+plot(gg)
+```
+
+The dashed line is where a perfect estimate would sit. B cells and CD14+
+monocytes are easy — both methods sit on the line. The interesting panels are
+the last two: for cytotoxic T cells and NK cells the blue NNLS points scatter
+well off the diagonal while the red MuSiC points stay close to it.
+
+That is not a coincidence about those two cell types specifically. Break the
+error down by cell type:
+
+```{r error_by_ct}
+err_music_mat <- abs(music_res$Est.prop.weighted[, select_ct] - prop_true_mat)
+err_nnls_mat  <- abs(music_res$Est.prop.allgene[, select_ct]  - prop_true_mat)
+
+round(rbind(MuSiC = colMeans(err_music_mat),
+            NNLS  = colMeans(err_nnls_mat)), 4)
+```
+
+NNLS's total error is concentrated almost entirely in cytotoxic T cells (0.099)
+and NK cells (0.059). **These are the two cell types whose expression profiles
+most resemble each other** — both are cytotoxic lymphocytes sharing granzyme and
+perforin programmes. When two columns of the reference look alike, the
+regression cannot tell which one produced the signal, and it splits the
+difference more or less arbitrarily from sample to sample. MuSiC cuts that error
+by a factor of four on cytotoxic T cells and six on NK cells.
+
+```{r stacked_bars, fig.width=8, fig.height=7}
+bar_df <- data.frame(
+  proportion = c(prop_true_mat,
+                 music_res$Est.prop.weighted[, select_ct],
+                 music_res$Est.prop.allgene[, select_ct]),
+  cell_type  = factor(rep(rep(select_ct, each = n_sample), times = 3),
+                      levels = select_ct),
+  sample     = factor(rep(rownames(prop_true_mat),
+                          times = 3 * length(select_ct)),
+                      levels = rownames(prop_true_mat)),
+  source     = factor(rep(c("Truth", "MuSiC", "NNLS"),
+                          each = n_sample * length(select_ct)),
+                      levels = c("Truth", "MuSiC", "NNLS")))
+
+gg <- ggplot2::ggplot(bar_df, ggplot2::aes(x = sample, y = proportion,
+                                           fill = cell_type)) +
+  ggplot2::geom_col(width = 0.8) +
+  ggplot2::facet_wrap(~ source, ncol = 1) +
+  ggplot2::labs(x = NULL, y = "Proportion", fill = "Cell type") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+plot(gg)
+```
+
+The same result read as composition. The MuSiC panel is close to a copy of the
+Truth panel. In the NNLS panel the blue and magenta bands — cytotoxic T and NK —
+visibly trade places against the truth, most obviously in samples 2, 3, 6 and 8,
+while the red B cell and olive monocyte bands are fine.
+
+# What the weighting actually does
+
+MuSiC's estimate is a weighted non-negative least squares fit: it solves the
+same equation NNLS does, but every gene enters with its own weight. The weight
+is, roughly, the reciprocal of how much that gene's contribution wobbles —
+combining the fit residual with the cross-subject variance of the gene's
+cell-type-specific expression. Genes that behave consistently get a large
+weight; genes that jump around get a small one.
+
+```{r weight_quantiles}
+weight_vec <- music_res$Weight.gene[, 1]
+weight_vec <- weight_vec[!is.na(weight_vec)]
+signif(quantile(weight_vec), 3)
+```
+
+The weights span four orders of magnitude within a single sample. The ceiling of
+10,000 is not data — it is `1 / nu`, where `nu = 1e-4` is `music_prop()`'s
+regularization argument, there to stop a perfectly-behaved gene from taking
+infinite weight.
+
+Which genes get pushed to the bottom?
+
+```{r low_weight_genes}
+names(sort(weight_vec))[1:10]
+```
+
+`GNLY`, `IGLC3`, `IGHA1`, `JCHAIN`, `FTH1`, ribosomal proteins, a mitochondrial
+gene. This list is worth staring at, because it looks backwards:
+
+> **Low weight does not mean "bad marker".** `GNLY` (granulysin) is one of the
+> most informative NK and cytotoxic-T markers there is. MuSiC down-weights it
+> anyway, because the weight measures *consistency*, not *specificity*. `GNLY`
+> is expressed at very high and very variable levels, so its absolute
+> contribution to a bulk sample is noisy, and a noisy gene given full weight
+> drags the fit around. The same goes for ribosomal and mitochondrial genes,
+> which are abundant and unstable. **MuSiC is not selecting markers.** It uses
+> all 18,013 genes and decides how much to trust each one — which is exactly the
+> step marker-based methods skip.
+
+The pattern is systematic — the more of the bulk library a gene accounts for,
+the lower its weight:
+
+```{r weight_vs_abundance, fig.width=7, fig.height=5}
+abundance_vec <- bulk_mat[names(weight_vec), 1] / sum(bulk_mat[, 1])
+weight_df     <- data.frame(abundance = abundance_vec, weight = weight_vec)
+weight_df     <- weight_df[weight_df$abundance > 0, ]
+nrow(weight_df)
+round(cor(log10(weight_df$abundance), log10(weight_df$weight)), 3)
+
+gg <- ggplot2::ggplot(weight_df, ggplot2::aes(x = abundance, y = weight)) +
+  ggplot2::geom_point(size = 0.4, alpha = 0.2) +
+  ggplot2::scale_x_log10() +
+  ggplot2::scale_y_log10() +
+  ggplot2::labs(x = "Gene's share of the bulk sample (log scale)",
+                y = "MuSiC weight (log scale)") +
+  ggplot2::theme_minimal()
+plot(gg)
+```
+
+A correlation of -0.695 on the log scale across 15,651 genes. The vertical
+stripes on the left are counts of 1, 2, 3 … — at low abundance the possible
+values are discrete.
+
+# Breaking it: a reference from the wrong assay
+
+Everything above holds the technology fixed. Let us see what that was worth.
+
+We rerun the identical bulk samples, changing one thing: the reference now comes
+from the three **10x Chromium v2** runs instead of the v3 cells. Same tissue,
+same donors, same lab, same paper, same manufacturer — one chemistry generation
+apart. Here the three separate runs give us three genuine replication units, so
+`samples` is a real column for once:
+
+```{r v2_reference}
+v2_vec      <- c("10x Chromium (v2)", "10x Chromium (v2) A",
+                 "10x Chromium (v2) B")
+keep_v2_vec <- obj$Method %in% v2_vec & obj$CellType %in% select_ct
+sum(keep_v2_vec)
+table(obj$Method[keep_v2_vec])
+
+sce_ref_v2 <- SingleCellExperiment::SingleCellExperiment(
+  assays  = list(counts = SeuratObject::LayerData(
+                   obj, assay = "RNA", layer = "counts")[, keep_v2_vec]),
+  colData = data.frame(CellType  = obj$CellType[keep_v2_vec],
+                       sample_id = obj$Method[keep_v2_vec],
+                       row.names = colnames(obj)[keep_v2_vec]))
+```
+
+Note that this reference is **larger** than the one that worked — 8,884 cells
+against 1,408 — so nothing that follows can be blamed on running short of data.
+
+```{r v2_prop}
+music_v2_res <- MuSiC::music_prop(bulk.mtx = bulk_mat, sc.sce = sce_ref_v2,
+                                  clusters = "CellType", samples = "sample_id",
+                                  select.ct = select_ct, verbose = FALSE)
+
+MuSiC::Eval_multi(prop.real = prop_true_mat,
+                  prop.est  = list(music_res$Est.prop.weighted,
+                                   music_v2_res$Est.prop.weighted),
+                  method.name = c("MuSiC, v3 reference",
+                                  "MuSiC, v2 reference"))
+```
+
+Correlation with the truth falls from **0.980 to 0.414**, and mean absolute
+error rises from 0.013 to 0.116 — an average miss of twelve percentage points on
+a proportion. Six times the reference cells, nine times the error.
+
+```{r v2_est}
+round(music_v2_res$Est.prop.weighted, 3)
+```
+
+Look at the `CD4+ T cell` column: exactly zero in four of the ten samples and
+0.002 in a fifth, when the truth is between 0.066 and 0.475. The estimate has
+not become noisy — it has collapsed. A whole cell type has been erased and its
+mass handed to CD14+ monocytes, which are over-estimated in every one of the ten
+samples.
+
+```{r v2_error_by_ct}
+round(colMeans(abs(music_v2_res$Est.prop.weighted[, select_ct]
+                   - prop_true_mat)), 4)
+```
+
+Why does one chemistry generation do this? Because v2 and v3 do not capture
+mRNA with the same efficiency, and the difference is not a constant factor
+across genes. The reference's picture of what a CD4+ T cell looks like is
+therefore systematically distorted relative to the bulk, and a
+non-negative fit responds to a distorted column by setting its coefficient to
+zero and letting a correlated column absorb the signal.
+
+The median library size tells the same story from the other end:
+
+```{r depth_by_method}
+tapply(obj$nCount_RNA, obj$Method, median)[c(v2_vec, "10x Chromium (v3)")]
+```
+
+4,508.5 UMIs per cell in v3 against 1,882 to 2,627 in the v2 runs — roughly
+double the depth, and depth is not neutral: it changes which genes are detected
+at all, and a gene that is zero in the reference but non-zero in the bulk cannot
+help identify anything.
+
+The crucial part is what you would have noticed **without** ground truth:
+
+```{r v2_rsq}
+round(music_v2_res$r.squared.full, 4)
+```
+
+R² falls from 0.9958–0.9997 to 0.7824–0.8079. On real bulk data you cannot check
+the proportions, but you can always check this — and a drop of this size is the
+signal that your reference does not describe your bulk samples.
+
+> **The lesson, which is the most portable thing in this tutorial.** Match your
+> reference to your bulk data on assay, chemistry, tissue and, where you can,
+> subject. A bigger reference from the wrong place is worse than a small one
+> from the right place. And read `r.squared.full` every single time — it is the
+> one honest diagnostic available when you have no truth to compare against.
+
+# What we glossed over
+
+- **Our four "donors" are fake.** Section 4.1 shuffled one donor's cells into
+  four piles so that `music_prop()` had a `samples` column. Real cross-subject
+  variance — the thing MuSiC is actually built to exploit — never entered this
+  analysis, which is part of why the main result is so clean. With real donors
+  you would also want more than four.
+- **Our bulk samples are too easy.** They were assembled from single-cell
+  libraries of the same protocol as the reference, so they carry none of the
+  differences that separate a real bulk RNA-seq library from a droplet
+  experiment: full-length rather than 3'-end reads, no UMIs, different
+  amplification, intronic reads from unspliced transcripts. Section 9 is a
+  lower bound on that problem, not an upper one.
+- **We never deconvolved anything real.** The natural next step on your own data
+  is bulk samples with no truth attached, where all you have is
+  `r.squared.full`, biological plausibility, and whether the proportions move
+  with a variable you expect them to move with.
+- **Collinear cell types have a dedicated tool.** The cytotoxic T / NK confusion
+  in Section 7 is exactly what `MuSiC::music_prop.cluster()` is for: it groups
+  similar cell types, estimates group proportions first, then splits within the
+  group using genes that separate its members. Worth knowing if your cell types
+  are finer-grained than ours.
+- **Multi-condition bulk needs MuSiC2.** If your bulk samples come from cases
+  and controls but your reference is all controls, the disease-affected genes
+  bias the fit. `MuSiC::music2_prop()` iterates between estimating proportions
+  and removing genes that behave differently between conditions.
+- **Where the cell type labels come from.** We used the authors' `CellType`
+  column as if handed down. On your own data those labels are an output of the
+  clustering and annotation work from **Week 4**, and every error in them
+  propagates directly into the reference — deconvolution can be no better than
+  the labels it is built on.
+- **The reference got no cleaning.** No ambient RNA correction, no doublet
+  removal — the **Week 2** steps — and no normalization choice, since MuSiC
+  normalizes internally rather than using the **Week 3** pipeline. Ambient RNA
+  in particular blurs cell type profiles together, which is precisely the
+  failure mode Section 7 showed.
+- **Other deconvolution methods exist**, and several are widely used:
+  CIBERSORTx, BayesPrism, dtangle, bseqsc, SCDC. MuSiC's own vignette benchmarks
+  against a couple of them. We compared only against the NNLS baseline that
+  `music_prop()` hands back for free.
+- **`MuSiC::Prop_comp_multi()` and `Jitter_Est()`** are the package's built-in
+  plotting functions and will look familiar from the vignette. We drew our own
+  figures instead: `Prop_comp_multi()` fixes its colour scale to the full 0–1
+  range, so when every proportion sits below 0.5 — as here — the whole heatmap
+  renders in near-identical blues.
+
+# References
+
+- Wang X, Park J, Susztak K, Zhang NR, Li M. *Bulk tissue cell type
+  deconvolution with multi-subject single-cell expression reference.* Nature
+  Communications 10:380, 2019.
+  [doi:10.1038/s41467-018-08023-x](https://doi.org/10.1038/s41467-018-08023-x)
+- Fan J, Lyu Y, Zhang Q, Wang X, Xiao R, Li M. *MuSiC2: cell-type deconvolution
+  for multi-condition bulk RNA-seq data.* Briefings in Bioinformatics
+  23:bbac430, 2022.
+  [doi:10.1093/bib/bbac430](https://doi.org/10.1093/bib/bbac430)
+- Ding J, Adiconis X, Simmons SK, *et al.* *Systematic comparative analysis of
+  single-nucleus and single-cell RNA-sequencing methods.* Nature Biotechnology
+  38:737–746, 2020.
+  [doi:10.1038/s41587-020-0465-8](https://doi.org/10.1038/s41587-020-0465-8)
+  — the source of `pbmcsca`.
+- MuSiC tutorial:
+  [xuranw.github.io/MuSiC](https://xuranw.github.io/MuSiC/articles/MuSiC.html)
+- `TOAST`:
+  [bioconductor.org/packages/TOAST](https://bioconductor.org/packages/TOAST)
