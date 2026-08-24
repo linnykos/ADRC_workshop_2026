@@ -44,11 +44,18 @@
 # once. If the job disappears with no R error in the .out file, look in the .err
 # file for a scheduler line about the memory limit or an oom-kill event — that
 # is the kernel stopping the job, not R, so there is no traceback to read.
-#SBATCH --mem=128G
+#
+# 64G is generous for the job as shipped, which integrates 10,000 nuclei against
+# 9,354. The six-region variant of the same script (133,007 on the query side) is
+# what wanted 128G. Raise this, never lower it, when you point the script at your
+# own data.
+#SBATCH --mem=64G
 
 # Wall clock. The job is killed when this runs out, part-way, with nothing
-# saved. Ask for more than you think you need; unused time is not charged.
-#SBATCH --time=4:00:00
+# saved. Ask for more than you think you need; unused time is not charged. The
+# job as shipped takes about 9 minutes, so this is roughly 13x headroom, which is
+# the right way round to be wrong.
+#SBATCH --time=2:00:00
 
 # --- Logs ---------------------------------------------------------------------
 

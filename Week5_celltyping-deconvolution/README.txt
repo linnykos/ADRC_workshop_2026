@@ -1,4 +1,4 @@
-Slides for Week 5: TBD
+Slides for Week 5: https://docs.google.com/presentation/d/1f8OrSpWqzW2ZjHnA9ejDC1je203hdZEE_rjsLL-gxUI/edit?usp=sharing
 
 music-deconvolution_tutorial.Rmd / .html / .R
   Bulk deconvolution with MuSiC. Builds ten synthetic bulk samples by summing

@@ -62,10 +62,9 @@ straight into `FeaturePlot()`, `DotPlot()`, or — and this is the whole point o
 the tutorial — into `FindMarkers()`, where it will cheerfully give you p-values
 that mean nothing.
 
-**And there is a third thing, which is not about integration at all.** Finding
-anchors between two studies takes half an hour and a great deal of memory, which
-is more than a laptop should be asked for in the middle of a session. So this
-document is split: the slow calls are shown here but not run here. They live in
+**And there is a third thing, which is not about integration at all.** This
+document is split across two machines. The anchor-finding, the correction and
+the label transfer are shown here but not run here: they live in
 `crossdataset-integration_server.R`, which you submit to a cluster with
 `crossdataset-integration_server.slurm`, and which writes one file that you copy
 back and load. **Getting a long-running R job off your laptop and onto a server
@@ -73,11 +72,18 @@ is a workshop goal in its own right**, and it is the part of this tutorial that
 transfers directly to your own data — every attendee with a dataset larger than a
 few thousand cells will need it, whatever method they end up running.
 
+Be clear about what is and is not being claimed there. On *this* pair of
+datasets the three calls take about **five minutes** on a laptop. They are on a
+server because a five-minute job is the right size to learn the mechanics on,
+not because they have to be — and the same script, on data three times the size,
+is where the habit starts paying. The section *Running the slow step somewhere
+else* has the measured numbers for both.
+
 The plan:
 
 | Stage | What it produces | Function |
 |---|---|---|
-| 1. Make the two objects comparable | Shared barcodes, shared genes, comparable sizes | `RenameCells()`, `subset()` |
+| 1. Make the two objects comparable | One shared brain region, shared barcodes, shared genes, comparable sizes | `subset()`, `RenameCells()` |
 | 2. Look at them uncorrected | A UMAP with one island per study | `merge()`, `RunPCA()`, `RunUMAP()` |
 | 3. Measure the separation | A per-cell batch-mixing score, against its null | `RANN::nn2()` |
 | 4. Send the slow part to a server | A batch job, and one file to copy back | `sbatch`, `scp` |
@@ -125,22 +131,9 @@ the authors' own `Supertype` annotation.
 **ROSMAP**, as analysed by Sun *et al.* (2023), profiled immune cells from six
 brain regions across 425 participants of the Religious Orders Study and Rush
 Memory and Aging Project, and assigned each microglial nucleus one of thirteen
-**states**, `MG0` through `MG12`. The file here is the middle temporal cortex
-subset: around ten thousand nuclei from 48 individuals.
-
-> **The region was matched on purpose, and this is the most important design
-> decision in the tutorial.** ROSMAP's largest region by far is prefrontal
-> cortex — six times as many microglia as middle temporal cortex, and the obvious
-> thing to reach for. Pairing SEA-AD's middle temporal gyrus with ROSMAP's
-> prefrontal cortex would have made **study** and **brain region** the same
-> variable. Every difference between the two would then have two explanations,
-> the integration would remove both, and no diagnostic could tell you which one
-> you had lost. Week 3 made the same check with one line, `table(Method,
-> Experiment)`, and found partial confounding in a dataset designed to be clean.
-> Here the check is made before the data is chosen rather than after.
->
-> Matching the region does not make the two studies comparable. It removes one
-> named reason they are not.
+**states**, `MG0` through `MG12`. The file here is the whole of that microglial
+set — 133,007 nuclei across all six regions — and the very first thing this
+tutorial does to it is throw five of the six regions away. Why, in a moment.
 
 ```{r data_dir}
 data_dir <- tempdir(check = TRUE)
@@ -220,26 +213,92 @@ table(seaad$Supertype)
 
 ```{r inspect_rosmap}
 SeuratObject::Layers(rosmap[["RNA"]])
-length(unique(rosmap$donor_id))
-table(rosmap$state)
-table(rosmap$sequencing_batch)
-table(rosmap$ad_diagnosis)
+Seurat::Reductions(rosmap)
+colnames(rosmap@meta.data)
+length(unique(rosmap$subject))
+table(rosmap$brainRegion)
+table(rosmap$State)
+table(rosmap$ADdiag3types)
 ```
 
 Two asymmetries are already visible and neither goes away.
 
-SEA-AD arrives **log-normalized** (a `counts` layer and a `data` layer); ROSMAP
-arrives as **counts only**. And the two studies do not use the same vocabulary
-for cell identity: SEA-AD has eight `Supertype` labels built around
-microglia/PVM subdivisions, ROSMAP has thirteen `state` labels built around
-activation programs. Neither is wrong, and there is no dictionary between them.
-That is the normal situation when you put two studies side by side, and the last
-section of this tutorial is about what you can do with it.
+**Each file arrives carrying somebody else's analysis, and not the same
+analysis.** That both objects came to us processed is normal and is not the
+problem; that they were processed differently is. SEA-AD has `counts` and a
+log-normalized `data` layer, and carries the authors' own `scVI` embedding plus a
+UMAP built from it — a published, deliberate product, and the thing the companion
+Week 4 clustering tutorial clusters on. ROSMAP has `counts`, `data` **and**
+`scale.data`, a generic `pca`/`umap` pair, and a `seurat_clusters` column:
+somebody's clustering, at some resolution, computed on all six regions at once.
+
+None of it is wrong and none of it is usable here. We renormalize both studies
+below, which replaces the inherited `data` layers; and nothing in this tutorial
+ever reads the inherited `scale.data`, the inherited reductions, or
+`seurat_clusters`, all of which describe cells and gene sets we are about to
+change. The habit worth taking is smaller than it sounds — **know which columns
+and layers in an object you computed and which arrived in the file** — because a
+`seurat_clusters` that came with a download looks exactly like one you produced,
+right up until it appears in a figure you are calling your result.
+
+**And the two studies do not use the same vocabulary for cell identity.** SEA-AD
+has eight `Supertype` labels built around microglia/PVM subdivisions; ROSMAP has
+`State` labels built around activation programs — twelve of Sun *et al.*'s
+thirteen are present in this file, `MG9` being absent. Neither is wrong, and
+there is no dictionary between them. That is the normal situation when you put
+two studies side by side, and the last section of this tutorial is about what you
+can do with it.
 
 # Making the two objects comparable
 
-Three things have to be reconciled before any integration method will touch
-them: barcodes, genes, and size.
+Four things have to be reconciled before any integration method will touch them:
+brain region, barcodes, genes, and size.
+
+## Region
+
+```{r subset_region}
+target_region <- "MidtemporalCortex"
+
+table(rosmap$brainRegion)
+tapply(rosmap$batch, rosmap$brainRegion, function(x){ length(unique(x)) })
+
+rosmap_cells <- Seurat::Cells(rosmap)[rosmap$brainRegion == target_region]
+rosmap <- subset(rosmap, cells = rosmap_cells)
+
+ncol(rosmap)
+length(unique(rosmap$subject))
+table(rosmap$batch)
+```
+
+> **Matching the region is the most important design decision in this tutorial,
+> and it costs 93% of the ROSMAP nuclei.** Prefrontal cortex is ROSMAP's largest
+> region by far — six times as many microglia as middle temporal cortex, and the
+> obvious thing to reach for if what you want is cells. Pairing SEA-AD's middle
+> temporal gyrus against it would have made **study** and **brain region** the
+> same variable. Every difference between the two would then have two
+> explanations, the integration would remove both, and no diagnostic could tell
+> you which one you had lost. Week 3 made the same check with one line,
+> `table(Method, Experiment)`, and found partial confounding in a dataset
+> designed to be clean.
+>
+> Keeping all six regions is worse than picking the wrong one, not better.
+> Region would then vary *inside* one of the two batches, leaving the anchors
+> free to align a middle-temporal-gyrus nucleus to a thalamic one; and the
+> ROSMAP side would outnumber the SEA-AD side thirteen to one, which is a second
+> and independent problem — see *Size* below.
+>
+> Matching the region does not make the two studies comparable. It removes one
+> named reason they are not.
+
+> **`batch` is not a sequencing batch here, and reading it as one would mislead
+> you.** Look at the second line of that chunk: five of ROSMAP's six regions have
+> exactly one `batch` value, and it is the region's own name. Only prefrontal
+> cortex is resolved further, into fourteen `SM_*` run identifiers plus a
+> residual `PFC`. So `table(rosmap$batch)` reporting a single batch for middle
+> temporal cortex is **not** evidence that it was sequenced in one go — it is the
+> absence of that information, wearing the same shape as an answer. Check what a
+> metadata column contains before you build an argument on it; this one is called
+> `batch` and sits right beside columns that do mean what they say.
 
 ## Barcodes
 
@@ -258,6 +317,13 @@ Cell barcodes are drawn from a fixed 10x whitelist, so two experiments will shar
 thousands of them. `merge()` would deduplicate silently by appending suffixes,
 and you would end up with an object whose cell names no longer match the ones in
 any table you saved earlier.
+
+As it happens neither of these two would have collided: look at the barcodes
+before the rename, and SEA-AD has already appended a library ID to each one while
+ROSMAP has already prefixed each with the brain region. But you cannot know that
+before you look, the check is one line, and `RenameCells()` is free — so do it
+anyway. Note also that ROSMAP's existing prefix is exactly the habit the next
+callout argues against.
 
 ```{r label_dataset}
 seaad$dataset <- "SEA-AD"
@@ -322,8 +388,9 @@ ncol(rosmap)
 > Anchors are mutual nearest neighbours; a cell in the small dataset has far more
 > candidate partners in the large one than the other way round, so the
 > correction is estimated much better in one direction than the other. Forty
-> thousand against ten thousand is a four-to-one ratio, and downsampling is the
-> cheapest way to remove that as an explanation for whatever we see.
+> thousand against nine and a third thousand is more than four to one, and
+> downsampling is the cheapest way to remove that as an explanation for whatever
+> we see.
 >
 > It also makes the mixing score below interpretable: with two batches of equal
 > size, "perfectly mixed" means half of every cell's neighbours come from the
@@ -360,7 +427,9 @@ length(integration_features)
 utils::head(integration_features, 20)
 ```
 
-Note how few of the two 2,000-gene lists agree. Each study's variable genes
+Fewer than half of the two 2,000-gene lists agree — 942 genes of 2,000, between
+two studies of the same cell type in the same brain region. Each study's variable
+genes
 partly describe that study's technical character, which is exactly why the gene
 selection has to happen **inside** each batch and then be combined —
 `SelectIntegrationFeatures()` ranks a gene by how often it is variable across the
@@ -388,6 +457,12 @@ table(merged$dataset)
 The layers stayed separate. That is Seurat v5's representation of "these cells
 came from different places", and it is what lets the pipeline below behave
 per-batch without being told to.
+
+Note the fifth layer, `scale.data.2`. That is ROSMAP's inherited scaling from
+earlier, riding along into the merged object with no counterpart on the SEA-AD
+side. Nothing here reads it — `ScaleData()` on the next line writes its own — but
+it is a tidy illustration of how a layer you never created survives a subset, a
+rename and a merge, and ends up inside an object you think of as yours.
 
 ```{r uncorrected_pipeline}
 merged <- Seurat::NormalizeData(merged, verbose = FALSE)
@@ -479,9 +554,10 @@ tapply(mixing_uncorrected, dataset_vec, stats::median)
 ```
 
 Compare the two: the median observed against the value the second line predicts.
-A score near zero means a cell's thirty nearest neighbours in a 30-dimensional
-space all came from its own study — that the strongest thing about a nucleus in
-this embedding is which lab sequenced it.
+The observed medians are not *near* zero, they are **zero**, for both studies —
+the thirty nearest neighbours of a typical nucleus, in a thirty-dimensional
+space, all came from its own study. The strongest thing about a nucleus in this
+embedding is which lab sequenced it, and it is not close.
 
 > **A mixing score alone rewards vandalism.** A method that mapped every cell to
 > the same point would land exactly on the null for both studies — a perfect
@@ -494,12 +570,43 @@ this embedding is which lab sequenced it.
 
 # Running the slow step somewhere else
 
-Everything so far has been cheap. The next two calls are not: on two datasets of
-ten thousand nuclei, `FindIntegrationAnchors()` and `IntegrateData()` together
-take upwards of half an hour and want more memory than most laptops have. That
-is a normal size for this kind of work, and it is the point at which analysis
-stops being something you do in the RStudio console and becomes something you
-*submit*.
+Everything so far has been cheap. The next two calls are the expensive ones, and
+it is worth being precise about how expensive, because the honest answer is not
+the one that makes the argument easiest.
+
+Measured, on the data as we have prepared it — 10,000 SEA-AD nuclei against
+9,354 ROSMAP ones:
+
+| Call | Time |
+|---|---|
+| `FindIntegrationAnchors()` | 4.4 min |
+| `IntegrateData()` | 0.3 min |
+| `FindTransferAnchors()` + `TransferData()` | 0.2 min |
+
+That is five minutes, on a laptop. It is not half an hour and we are not going to
+pretend it is.
+
+**So why send it to a cluster at all?** Two reasons, and the first one is the
+honest one.
+
+**Because five minutes is the right size to learn on.** Every part of the
+submit-and-wait loop — a directive the scheduler rejects, an account you do not
+have, a package missing on the compute node, a log you have to go and find — you
+will get wrong the first two or three times. Getting them wrong against a
+five-minute job costs you five minutes. Getting them wrong for the first time
+against the job you actually care about costs you an afternoon, usually the
+afternoon before something is due.
+
+**And because the same script, on more data, is genuinely not a laptop job.**
+Both calls scale with the number of query nuclei. An earlier run of this exact
+script that kept **all six** ROSMAP regions — 133,007 query nuclei instead of
+9,354 — took **40 minutes** end to end on a compute node, and its output file was
+1.7 GB rather than 376 MB. Nothing about the code changed; one `subset()` call
+did. That is how this arrives on your own data: not as a decision you make, but
+as a Tuesday when the thing that ran fine last month stops finishing.
+
+Either way it is the point at which analysis stops being something you do in the
+RStudio console and becomes something you *submit*.
 
 Two files in this folder do that:
 
@@ -525,8 +632,8 @@ looks like a comment to the shell and is in fact a directive to the scheduler:
 #SBATCH --account=YOUR_ACCOUNT
 #SBATCH --partition=YOUR_PARTITION
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=128G
-#SBATCH --time=4:00:00
+#SBATCH --mem=64G
+#SBATCH --time=2:00:00
 #SBATCH --output=crossdataset-integration_%j.out
 ```
 
@@ -583,8 +690,9 @@ job. Seconds of work belong where you can see their output.
 The other half of that habit is that the script **checks its assumptions at the
 top**. It verifies the packages are installed before doing anything, and stops
 with the `install.packages()` line to paste if they are not. A batch job that
-fails at minute forty because one package is missing has spent forty minutes of
-queue time to tell you something it could have told you in the first second.
+waits an hour in the queue and then dies because one package is missing has
+spent that hour telling you something it could have told you in its first
+second — and the queue wait, not the run time, is what you paid.
 
 # Integrating so that the expression matrix is corrected too
 
@@ -611,7 +719,8 @@ integration_anchors <- Seurat::FindIntegrationAnchors(
 class(integration_anchors)
 ```
 
-This is the slow step — this is the half hour. Canonical correlation analysis
+This is the slow step — four of the five minutes, and essentially all of the
+memory. Canonical correlation analysis
 finds directions of variation *shared* between the two datasets rather than
 maximal within either; pairs of cells that are mutual nearest neighbours in that
 shared space become **anchors**. An anchor is the method's assertion that *this*
@@ -685,7 +794,9 @@ run_info
 ```
 
 ```{r verify_server_results}
-# Did both machines draw the same 10,000 nuclei, and select the same genes?
+# Did both machines keep the same region, draw the same 10,000 nuclei, and
+# select the same genes?
+identical(run_info$target_region, target_region)
 identical(local_seaad_cells, seaad_cells)
 identical(local_features, integration_features)
 
@@ -693,7 +804,8 @@ identical(local_features, integration_features)
 setequal(Seurat::Cells(integrated),
          c(Seurat::Cells(seaad), Seurat::Cells(rosmap)))
 
-stopifnot(identical(local_seaad_cells, seaad_cells),
+stopifnot(identical(run_info$target_region, target_region),
+          identical(local_seaad_cells, seaad_cells),
           setequal(Seurat::Cells(integrated),
                    c(Seurat::Cells(seaad), Seurat::Cells(rosmap))))
 ```
@@ -709,8 +821,10 @@ stopifnot(identical(local_seaad_cells, seaad_cells),
 > one you should check. `run_info` above says what the server actually ran.
 >
 > If a check fails, the usual cause is that the two scripts drifted — someone
-> changed `n_cells`, or the gene intersection, on one side only. The fix is to
-> resubmit the job, not to force the objects together.
+> changed `target_region` or `n_cells`, or the gene intersection, on one side
+> only. That is why all three settings travel back inside `run_info`: a mismatch
+> should be a failed comparison you can read, not a silently different answer.
+> The fix is to resubmit the job, not to force the objects together.
 
 ```{r inspect_loaded}
 integrated
@@ -785,6 +899,47 @@ zero by construction; a negative number in that matrix is not a low expression
 level, it is not an expression level at all. It is the residue of a subtraction
 between two cells that a nearest-neighbour search decided were comparable.
 
+## Which dataset was corrected?
+
+The obvious reading of "the correction" is that both studies were adjusted
+toward each other. Check it rather than assume it.
+
+```{r reference_vs_query}
+rna_sub <- rna_data[rownames(integrated_data), ]
+
+seaad_idx <- which(integrated$dataset == "SEA-AD")
+rosmap_idx <- which(integrated$dataset == "ROSMAP")
+
+max(abs(integrated_data[, seaad_idx] - rna_sub[, seaad_idx]))
+max(abs(integrated_data[, rosmap_idx] - rna_sub[, rosmap_idx]))
+
+sum(integrated_data[, seaad_idx] < 0)
+sum(integrated_data[, rosmap_idx] < 0)
+```
+
+> **`IntegrateData()` did not correct both datasets. It corrected one of them and
+> left the other untouched, and it did not tell you which.** The largest change
+> to any SEA-AD value is exactly **zero** — all 10,000 SEA-AD nuclei come out of
+> the integrated assay byte-identical to what went in. ROSMAP moved by up to
+> **2.69** log-units, and 85% of its values changed. Every negative number in the
+> matrix — the thing the previous section was about — belongs to ROSMAP; SEA-AD
+> has none, because SEA-AD was never touched.
+>
+> This is by design, not a bug: given a list of two objects, the anchor route
+> designates one as the **reference** and maps the **query** onto it. But nothing
+> in the call we wrote says which is which, the returned object does not record
+> it, and no message is printed. It fell out of the order of
+> `list(seaad, rosmap)`.
+>
+> The consequence is worth stating plainly, because it is the opposite of what
+> "batch correction" sounds like it means: **the corrected matrix is not
+> symmetric, and the two studies in it do not have the same status.** One is raw
+> measurement, the other is a reconstruction. Any comparison you draw across that
+> boundary — a fold change, a difference of means, a marker that looks
+> study-specific — inherits an asymmetry you did not choose and cannot see in the
+> values. If the direction matters to your question, set it deliberately with
+> `IntegrateData(reference = ...)` and say which way round you ran it.
+
 ```{r zero_filling}
 marker_candidates <- c("P2RY12", "CX3CR1", "CSF1R", "C1QB", "APOE", "SPP1")
 marker_gene <- marker_candidates[marker_candidates %in%
@@ -800,11 +955,24 @@ what is present* rather than hard-coded. A gene that survived the intersection
 can still have been dropped by the anchor-feature selection, and a hard-coded
 name would fail three chunks later with `subscript out of bounds`.
 
-The zero counts are the other half of the story. A gene that was undetected in a
-cell — a structural zero, a dropout, a real absence, you cannot tell which — has
-been given a non-zero value by the correction. Every zero-inflation model, every
-detection-rate covariate, every `min.pct` filter is now reading a number that was
-imputed rather than measured.
+**And it happened.** The first candidate in that list is `P2RY12` — the canonical
+homeostatic microglial marker, the gene you would reach for first in this
+dataset — and it is not among the 2,000 anchor features, so it is not in the
+integrated assay at all. The line falls through to `CX3CR1`. Nothing announced
+this; the object simply does not have that row. If your figure depends on a
+particular gene, check it is there before you build on it.
+
+The zero counts are the other half of the story, and the two numbers divide
+exactly along the line the previous section drew. `CX3CR1` was undetected in
+**10,035** of the 19,354 nuclei; after correction **4,958** are still zero. The
+difference is **5,077** — which is precisely the number of ROSMAP nuclei in that
+stripe. Every ROSMAP zero was filled in and every SEA-AD zero was left alone.
+
+A gene undetected in a cell — a structural zero, a dropout, a real absence, you
+cannot tell which — now carries a number in one study and not in the other. Every
+zero-inflation model, every detection-rate covariate, every `min.pct` filter is
+reading a quantity that is measured on one side of the object and imputed on the
+other.
 
 ```{r scatter_rna_vs_integrated, fig.width=7, fig.height=5, cache=FALSE}
 compare_df <- data.frame(
@@ -824,10 +992,16 @@ plot(gg)
 ```
 
 The dashed line is where the two would agree. The red line is zero: everything
-below it is a value with no possible interpretation as an amount of RNA. Note
-also that the vertical stripe at `x = 0` — the cells where this gene was not
-detected — has been spread across a range of corrected values, and that the two
-studies are shifted differently, which is the correction doing its job.
+below it is a value with no possible interpretation as an amount of RNA.
+
+The colours make the asymmetry visible in one glance. **SEA-AD lies exactly on
+the dashed line** — every teal point, because those values were not changed.
+Every displaced point is ROSMAP, and so is the whole vertical stripe at
+`x = 0`: the cells where `CX3CR1` went undetected, spread by the correction
+across a band of invented values, a good part of it below the red line. This is
+the same fact the chunk above measured, drawn rather than counted, and it is the
+figure to keep in mind the next time a corrected matrix is offered to you as
+"the data".
 
 # Re-embedding on the corrected values
 
@@ -874,6 +1048,29 @@ tapply(mixing_integrated, integrated$dataset, stats::median)
 1 - dataset_share
 ```
 
+Read those three lines together, because the answer is more interesting than
+"it worked".
+
+Before correction both medians are **0**. After it, the two studies do not move
+the same distance: SEA-AD's median rises to **0.43**, against a null of 0.48 —
+about as mixed as a balanced design allows. ROSMAP's rises only to **0.07**,
+against a null of 0.52. Most ROSMAP nuclei still have 28 of their 30 neighbours
+from ROSMAP.
+
+That is not a contradiction, and it is the reason to report this score **per
+batch** rather than pooled. Nearest-neighbour relationships are not symmetric,
+and we already know from the last section which side moved: ROSMAP. Enough
+ROSMAP nuclei were mapped into SEA-AD's territory that a typical SEA-AD nucleus
+now has ROSMAP neighbours — but most ROSMAP nuclei were not, and still see only
+each other. The *Before* and *After* panels show the same thing geometrically:
+SEA-AD is a dense core, and ROSMAP is a larger cloud that closes over it only
+partly. A single pooled median would have landed between the two numbers and
+described neither study.
+
+Whether that is good enough depends entirely on what you do next. It is fine for
+putting both studies on one set of axes. It is not a licence to say the two
+studies' nuclei are now interchangeable.
+
 ```{r mixing_histogram, fig.width=8, fig.height=4, cache=FALSE}
 mixing_df <- rbind(
   data.frame(mixing = mixing_uncorrected, dataset = merged$dataset,
@@ -895,10 +1092,19 @@ plot(gg)
 
 The dashed line is the balanced-design null. Read the *shape*, not only the
 median: a distribution piled at zero with a thin tail says most cells never left
-their own study, and a broad distribution centred near the line says the mixing
-is general rather than driven by a handful of cells. A bimodal one — a mixed
+their own study; a broad distribution centred near the line says the mixing is
+general rather than driven by a handful of cells; and a bimodal one — a mixed
 population and an unmixed one — usually means a cell type that only one study
-captured, and that is worth finding before you interpret anything.
+captured.
+
+All three are on this one panel, which is why the medians alone were not enough.
+ROSMAP is the first shape: piled against zero, with a tail that barely reaches
+0.3. SEA-AD is the second and the third at once — a broad hump spread across the
+whole range, and *also* its own spike still sitting at zero. Those SEA-AD nuclei,
+the ones that found no ROSMAP neighbour at all, are the population to go and
+identify before interpreting anything: they are either a cell type ROSMAP's
+middle temporal cortex did not capture, or a piece of SEA-AD the correction could
+find no anchor for. Which of the two it is cannot be settled from this figure.
 
 > **Residual separation is not automatically a failure.** Two studies with
 > different dissections and different chemistries can genuinely capture different
@@ -968,18 +1174,25 @@ gg2 <- Seurat::FeaturePlot(integrated, features = marker_gene,
   ggplot2::ggtitle(paste0(marker_gene, ", corrected"))
 
 Seurat::DefaultAssay(integrated) <- "RNA"
-plot(gg1 + gg2)
+plot(patchwork::wrap_plots(gg1, gg2, ncol = 2))
 ```
 
 Two panels, one gene, one set of coordinates, one argument different — and the
 argument was never written down anywhere in the figure. If you make plots from
 both assays in the same analysis, put the assay in the title, every time.
 
+The two panels also look more alike than they are, and by now you know why: half
+the cells on those axes are SEA-AD, and SEA-AD's values are identical between
+them. Every difference you can see is a ROSMAP cell. A figure that averages a
+corrected study together with an uncorrected one, on shared axes, with no
+indication of which is which, is a fair description of most published
+integration figures.
+
 # The alternative that never edits expression: label transfer
 
 There is a second thing people usually want when they reach for integration, and
 it does not require correcting anything. **What are my cells, in someone else's
-vocabulary?** ROSMAP's nuclei have `state` labels; SEA-AD's have `Supertype`
+vocabulary?** ROSMAP's nuclei have `State` labels; SEA-AD's have `Supertype`
 labels; the question is how they correspond.
 
 This runs on the server too. `FindTransferAnchors()` is the same anchor
@@ -1019,17 +1232,25 @@ everything downstream — pseudobulk aggregation, DESeq2, composition testing �
 operates on measurements.
 
 ```{r label_crosstab}
-label_tab <- table(rosmap$state, rosmap$predicted.id)
+label_tab <- table(rosmap$State, rosmap$predicted.id)
 label_tab
 
 round(label_tab / rowSums(label_tab), 2)
 ```
 
+Look at the totals before the proportions. Twelve ROSMAP states went in; **six**
+of SEA-AD's eight supertypes came out, and one of them, `Micro-PVM_2`, accounts
+for **7,410 of 9,354** nuclei — 79%. Two SEA-AD supertypes were never predicted
+for any cell. A twelve-way distinction has been flattened into what is
+effectively a two-way one.
+
 The row proportions are the readable version: for each ROSMAP state, where do
 those nuclei land in SEA-AD's vocabulary? A row concentrated in one column is a
-state the reference recognizes. A row spread across several is a state the
-reference has no name for, and this is where the method's central limitation
-shows.
+state the reference recognizes — `MG8` goes 96% to `Micro-PVM_2`, `MG0` 91%. A
+row spread across several is a state the reference has no name for: `MG10` splits
+45/52 between two supertypes, `MG2` 56/43. And a row can be *confidently* wrong,
+which the proportions cannot show you at all — that is what the next callout is
+about.
 
 > **Label transfer cannot say "I do not know".** Every query cell gets the
 > reference's best-matching label, whether or not the reference contains anything
@@ -1037,12 +1258,15 @@ shows.
 > does not come back as unlabelled; it comes back as the nearest supertype, with
 > a confident-looking integer count in a table. `prediction.score.max` is the only
 > thing standing between you and that — cells whose best score is barely above
-> their second-best are cells whose label you should not use. Look at the
-> quantiles above, pick a floor, and say what it was.
+> their second-best are cells whose label you should not use. The quantiles above
+> are worth sitting with: the median nucleus scores **0.75**, but the bottom
+> quarter is below **0.59** and the weakest is **0.26** — a label with almost
+> nothing behind it, reported in the same table, in the same font, as one scoring
+> 1.00. Pick a floor, apply it, and say in your methods what it was.
 >
 > The same caution applies in reverse to the direction of the transfer. We made
 > SEA-AD the reference because its annotation is the one being borrowed; running
-> it the other way, with ROSMAP's thirteen states as the reference, is a different
+> it the other way, with ROSMAP's twelve states as the reference, is a different
 > analysis and can disagree.
 
 # What we glossed over
@@ -1068,6 +1292,12 @@ shows.
   all-against-all, which is the difference between an afternoon and a week.
   `sample.tree` in `IntegrateData()` controls the merge order, which is not
   cosmetic.
+- **Choosing the reference deliberately.** We let the order of
+  `list(seaad, rosmap)` decide which study was corrected onto which, discovered
+  it afterwards by measuring, and left it. `IntegrateData(reference = ...)` and
+  `FindIntegrationAnchors(reference = ...)` make it a stated choice. Running it
+  the other way round is a different object and a different set of negative
+  numbers, and nothing in either output would tell a reader which you did.
 - **`k.anchor`, `k.filter`, `k.weight`.** Left at defaults. `k.weight` is the one
   that will actually break on you: it must not exceed the number of cells in the
   smallest dataset, and a small batch produces an error deep inside
@@ -1075,6 +1305,14 @@ shows.
 - **How many dimensions.** Thirty, everywhere, taken from the vignette and never
   defended — the same unexamined choice Week 3 flagged. It sets how much
   structure both the anchor-finding and the UMAP can see.
+- **Five-sixths of ROSMAP.** We kept middle temporal cortex and discarded
+  angular gyrus, entorhinal cortex, hippocampus, prefrontal cortex and
+  thalamus — 123,653 nuclei — so that region would not be confounded with study.
+  Integrating across regions *within* ROSMAP first, and then integrating that
+  against SEA-AD, is a defensible alternative and a different tutorial: it treats
+  region as a batch to be corrected rather than as a variable to be held fixed,
+  which is a claim about regional microglial identity that you would have to be
+  willing to defend.
 - **Whether these two studies should be integrated at all.** They have no shared
   donors and no shared protocol, so "study" is confounded with everything about
   how the tissue was collected and processed. Integration will always produce

@@ -12,10 +12,12 @@
 # UNLIKE THE OTHER SCRIPTS HERE, THIS ONE DOES NOT RUN AS-IS. The two
 # integration calls and the label transfer are meant to run on a server, via
 # crossdataset-integration_server.R and its .slurm file; here they are left
-# in place so you can read them, but running them on a laptop takes upwards
-# of half an hour and a lot of memory. The load() of
-# crossdataset-integration_results.RData part-way down is where the server's
-# output comes back in. See the .html for the whole story.
+# in place so you can read them. On this data they take about five minutes
+# and a lot of memory, so you CAN run them here -- but the load() of
+# crossdataset-integration_results.RData part-way down, which is where the
+# server's output is meant to come back in, will then fail with no such file.
+# Run the server script first, on a cluster or locally, and put the .RData it
+# writes beside this script. See the .html for the whole story.
 
 # Setting up -------------------------------------------------------------------
 
@@ -79,12 +81,27 @@ length(unique(seaad$donor_id))
 table(seaad$Supertype)
 
 SeuratObject::Layers(rosmap[["RNA"]])
-length(unique(rosmap$donor_id))
-table(rosmap$state)
-table(rosmap$sequencing_batch)
-table(rosmap$ad_diagnosis)
+Seurat::Reductions(rosmap)
+colnames(rosmap@meta.data)
+length(unique(rosmap$subject))
+table(rosmap$brainRegion)
+table(rosmap$State)
+table(rosmap$ADdiag3types)
 
 # Making the two objects comparable --------------------------------------------
+
+## Region
+target_region <- "MidtemporalCortex"
+
+table(rosmap$brainRegion)
+tapply(rosmap$batch, rosmap$brainRegion, function(x){ length(unique(x)) })
+
+rosmap_cells <- Seurat::Cells(rosmap)[rosmap$brainRegion == target_region]
+rosmap <- subset(rosmap, cells = rosmap_cells)
+
+ncol(rosmap)
+length(unique(rosmap$subject))
+table(rosmap$batch)
 
 ## Barcodes
 utils::head(Seurat::Cells(seaad), 3)
@@ -254,7 +271,9 @@ load(results_file)
 ls()
 run_info
 
-# Did both machines draw the same 10,000 nuclei, and select the same genes?
+# Did both machines keep the same region, draw the same 10,000 nuclei, and
+# select the same genes?
+identical(run_info$target_region, target_region)
 identical(local_seaad_cells, seaad_cells)
 identical(local_features, integration_features)
 
@@ -262,7 +281,8 @@ identical(local_features, integration_features)
 setequal(Seurat::Cells(integrated),
          c(Seurat::Cells(seaad), Seurat::Cells(rosmap)))
 
-stopifnot(identical(local_seaad_cells, seaad_cells),
+stopifnot(identical(run_info$target_region, target_region),
+          identical(local_seaad_cells, seaad_cells),
           setequal(Seurat::Cells(integrated),
                    c(Seurat::Cells(seaad), Seurat::Cells(rosmap))))
 
@@ -293,6 +313,18 @@ stopifnot(all(colnames(integrated_data) == colnames(rna_data)))
 range(rna_data)
 range(integrated_data)
 sum(integrated_data < 0) / length(integrated_data)
+
+## Which dataset was corrected?
+rna_sub <- rna_data[rownames(integrated_data), ]
+
+seaad_idx <- which(integrated$dataset == "SEA-AD")
+rosmap_idx <- which(integrated$dataset == "ROSMAP")
+
+max(abs(integrated_data[, seaad_idx] - rna_sub[, seaad_idx]))
+max(abs(integrated_data[, rosmap_idx] - rna_sub[, rosmap_idx]))
+
+sum(integrated_data[, seaad_idx] < 0)
+sum(integrated_data[, rosmap_idx] < 0)
 
 marker_candidates <- c("P2RY12", "CX3CR1", "CSF1R", "C1QB", "APOE", "SPP1")
 marker_gene <- marker_candidates[marker_candidates %in%
@@ -391,7 +423,7 @@ gg2 <- Seurat::FeaturePlot(integrated, features = marker_gene,
   ggplot2::ggtitle(paste0(marker_gene, ", corrected"))
 
 Seurat::DefaultAssay(integrated) <- "RNA"
-plot(gg1 + gg2)
+plot(patchwork::wrap_plots(gg1, gg2, ncol = 2))
 
 # The alternative that never edits expression: label transfer ------------------
 
@@ -415,7 +447,7 @@ rosmap <- Seurat::AddMetaData(rosmap, metadata = predictions_df)
 table(rosmap$predicted.id)
 stats::quantile(rosmap$prediction.score.max)
 
-label_tab <- table(rosmap$state, rosmap$predicted.id)
+label_tab <- table(rosmap$State, rosmap$predicted.id)
 label_tab
 
 round(label_tab / rowSums(label_tab), 2)

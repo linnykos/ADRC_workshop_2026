@@ -20,11 +20,17 @@
 # install anything — it checks that the packages are already there and stops
 # immediately if they are not.
 #
-# Cost: not yet measured on this pair of datasets. Budget on the order of an
-# hour, and expect the memory rather than the time to be what bites -- almost
-# all of both is FindIntegrationAnchors() and IntegrateData(). The .slurm file
-# asks for 128G and 4 hours as a starting point. The script times the two slow
-# calls and prints the result, so after one run you will know what to ask for.
+# Cost, measured: about 9 minutes end to end, of which FindIntegrationAnchors()
+# is 4.4 min, IntegrateData() 0.3 min, the label transfer 0.2 min, and most of
+# the rest is reading the 1.5 GB ROSMAP file. It writes a 376 MB .RData.
+#
+# That is small, and deliberately so -- see the tutorial's "Running the slow step
+# somewhere else" for why a five-minute job is the right one to learn sbatch on.
+# For contrast, the same script keeping all six ROSMAP brain regions (133,007
+# query nuclei instead of 9,354) took 40 minutes and wrote 1.7 GB. Both calls
+# scale with the number of query cells, and on a big enough query it is the
+# memory rather than the time that bites. The script times the slow calls and
+# prints the result, so after one run on YOUR data you will know what to ask for.
 
 # Settings ---------------------------------------------------------------------
 
@@ -39,16 +45,20 @@ out_dir <- getwd()
 
 results_file <- file.path(out_dir, "crossdataset-integration_results.RData")
 
-# The two knobs the tutorial discusses. n_cells is how many nuclei to keep from
-# each study, so that neither side dominates the anchor search; n_dims is how
-# many dimensions the anchor search and the correction are allowed to see.
+# The three knobs the tutorial discusses. target_region is the ROSMAP brain
+# region to keep: the shipped file holds all six that Sun et al. profiled, and
+# pairing SEA-AD's middle temporal gyrus against any other one would make
+# "study" and "brain region" the same variable. n_cells is how many nuclei to
+# keep from SEA-AD, so that neither side dominates the anchor search; n_dims is
+# how many dimensions the anchor search and the correction are allowed to see.
+target_region <- "MidtemporalCortex"
 n_cells <- 10000
 n_dims <- 30
 
 # Checking the packages are there ----------------------------------------------
 
-# A batch job that fails at minute 40 because one package is missing has cost
-# you 40 minutes of queue time. Check first, fail in the first second.
+# A batch job that waits an hour in the queue and then dies because one package
+# is missing has cost you that hour. Check first, fail in the first second.
 #
 # This is the whole list, and it is shorter than the tutorial's: the .Rmd also
 # needs RANN, ggplot2 and patchwork, and none of them are here because none of
@@ -123,9 +133,23 @@ rm(list = c("seurat_obj")); gc(TRUE)
 # they do, and that check is the only thing standing between you and a silent
 # mismatch.
 #
-# The one intended difference: n_cells and n_dims are settings up top here and
-# are written out as 10000 and 1:30 in the .Rmd. Change one and you must change
-# the other. The .Rmd's check will catch it if you forget.
+# The one intended difference: target_region, n_cells and n_dims are settings up
+# top here and are written out as "MidtemporalCortex", 10000 and 1:30 in the
+# .Rmd. Change one and you must change the other. The .Rmd's check will catch it
+# if you forget -- all three travel back inside run_info for exactly that reason.
+
+# The ROSMAP file ships all six brain regions. Cutting it down to one is the
+# first thing that happens to it, before anything is renamed, subset by gene or
+# normalized, so that every count printed below counts what we actually
+# integrate. Assert the region exists rather than discovering an empty object
+# forty minutes later.
+stopifnot(target_region %in% rosmap$brainRegion)
+
+rosmap_cells <- Seurat::Cells(rosmap)[rosmap$brainRegion == target_region]
+rosmap <- subset(rosmap, cells = rosmap_cells)
+
+cat("ROSMAP", target_region, "nuclei:", ncol(rosmap), "\n")
+cat("ROSMAP donors:", length(unique(rosmap$subject)), "\n")
 
 seaad <- Seurat::RenameCells(seaad, add.cell.id = "seaad")
 rosmap <- Seurat::RenameCells(rosmap, add.cell.id = "rosmap")
@@ -220,6 +244,7 @@ cat("TransferData:",
 run_info <- list(r_version = R.version.string,
                  seurat_version = as.character(utils::packageVersion("Seurat")),
                  rng_kind = RNGkind(),
+                 target_region = target_region,
                  n_cells = n_cells,
                  n_dims = n_dims,
                  run_at = Sys.time())
