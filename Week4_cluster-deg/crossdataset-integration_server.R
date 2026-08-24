@@ -153,6 +153,8 @@ seaad <- Seurat::FindVariableFeatures(seaad, selection.method = "vst",
 rosmap <- Seurat::FindVariableFeatures(rosmap, selection.method = "vst",
                                        nfeatures = 2000, verbose = FALSE)
 
+# Allow up to 16 GB (16 * 1024^3 bytes) for exported globals
+options(future.globals.maxSize = 16 * 1024^3)
 integration_features <- Seurat::SelectIntegrationFeatures(
   object.list = list(seaad, rosmap),
   nfeatures = 2000,
