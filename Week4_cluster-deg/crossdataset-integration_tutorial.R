@@ -4,10 +4,18 @@
 # This is the code from crossdataset-integration_tutorial.Rmd / .html, with nothing else.
 # See the .html for what each step is doing and why.
 #
-# Two datasets (seaad_microglia.RData, 525 MB, and rosmap_microglia.RData)
-# download themselves into a temporary folder, so this script should run
-# as-is. Nothing is written to your machine outside that folder. The first
-# run takes several minutes on the downloads.
+# Two datasets (seaad_microglia.RData, 525 MB, and rosmap_microglia.RData,
+# 1.5 GB) download themselves into a temporary folder. Nothing is written to
+# your machine outside that folder. The first run takes several minutes on
+# the downloads.
+#
+# UNLIKE THE OTHER SCRIPTS HERE, THIS ONE DOES NOT RUN AS-IS. The two
+# integration calls and the label transfer are meant to run on a server, via
+# crossdataset-integration_server.R and its .slurm file; here they are left
+# in place so you can read them, but running them on a laptop takes upwards
+# of half an hour and a lot of memory. The load() of
+# crossdataset-integration_results.RData part-way down is where the server's
+# output comes back in. See the .html for the whole story.
 
 # Setting up -------------------------------------------------------------------
 
@@ -43,15 +51,11 @@ if (!file.exists(seaad_file) || file.size(seaad_file) != seaad_size) {
 
 file.size(seaad_file) == seaad_size
 
-## TODO(Kevin): run private/code/rosmap/prep_rosmap_microglia_claude.R, upload
-## the .RData it writes, and replace the two placeholder values below with the
-## dl=1 share link and the byte count the script prints. This chunk cannot run
-## until then. Delete this comment afterwards.
-rosmap_url <- paste0("https://www.dropbox.com/scl/fi/PLACEHOLDER/",
+rosmap_url <- paste0("https://www.dropbox.com/scl/fi/siecgiljoks48pkin42ts/",
                      "rosmap_microglia.RData",
-                     "?rlkey=PLACEHOLDER&dl=1")
+                     "?rlkey=vwnmoeynhbsuxkiumz36hy301&dl=1")
 rosmap_file <- file.path(data_dir, "rosmap_microglia.RData")
-rosmap_size <- 0
+rosmap_size <- 1507998516
 
 if (!file.exists(rosmap_file) || file.size(rosmap_file) != rosmap_size) {
   download.file(rosmap_url, destfile = rosmap_file, mode = "wb")
@@ -213,6 +217,7 @@ tapply(mixing_uncorrected, dataset_vec, stats::median)
 
 # Integrating so that the expression matrix is corrected too -------------------
 
+# Runs on the server, not here. See crossdataset-integration_server.R.
 integration_anchors <- Seurat::FindIntegrationAnchors(
   object.list = list(seaad, rosmap),
   anchor.features = integration_features,
@@ -222,10 +227,45 @@ integration_anchors <- Seurat::FindIntegrationAnchors(
 
 class(integration_anchors)
 
+# Runs on the server, not here. See crossdataset-integration_server.R.
 integrated <- Seurat::IntegrateData(anchorset = integration_anchors,
                                     new.assay.name = "integrated",
                                     dims = 1:30,
                                     verbose = FALSE)
+
+# Bringing the result back -----------------------------------------------------
+
+results_file <- "crossdataset-integration_results.RData"
+
+# The default looks for the file next to this document. If you put it somewhere
+# else, point at it here, e.g.:
+# results_file <- "/path/to/crossdataset-integration_results.RData"
+
+if (!file.exists(results_file)) {
+  stop("Cannot find ", results_file, ". Run crossdataset-integration_server.R ",
+       "on a server (see the previous section) and copy the file it writes ",
+       "next to this document.", call. = FALSE)
+}
+
+local_seaad_cells <- seaad_cells
+local_features <- integration_features
+
+load(results_file)
+
+ls()
+run_info
+
+# Did both machines draw the same 10,000 nuclei, and select the same genes?
+identical(local_seaad_cells, seaad_cells)
+identical(local_features, integration_features)
+
+# And does the object that came back describe the cells we have in front of us?
+setequal(Seurat::Cells(integrated),
+         c(Seurat::Cells(seaad), Seurat::Cells(rosmap)))
+
+stopifnot(identical(local_seaad_cells, seaad_cells),
+          setequal(Seurat::Cells(integrated),
+                   c(Seurat::Cells(seaad), Seurat::Cells(rosmap))))
 
 integrated
 Seurat::Assays(integrated)
@@ -356,6 +396,7 @@ plot(gg1 + gg2)
 
 # The alternative that never edits expression: label transfer ------------------
 
+# Runs on the server, not here. See crossdataset-integration_server.R.
 transfer_anchors <- Seurat::FindTransferAnchors(reference = seaad,
                                                 query = rosmap,
                                                 dims = 1:30,

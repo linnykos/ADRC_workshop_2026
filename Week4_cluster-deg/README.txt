@@ -32,6 +32,32 @@ one alongside it.
       alternative that never edits expression.
       Built from Kevin's Writeup30b exploration scripts.
 
+      THIS ONE IS SPLIT ACROSS TWO MACHINES. Finding anchors between the two
+      studies takes upwards of half an hour and a lot of memory, so those calls
+      are shown in the tutorial but marked eval=FALSE and run on a cluster
+      instead. Running R as a batch job is a teaching goal of the tutorial in
+      its own right. The two extra files:
+
+  crossdataset-integration_server.R
+      Self-contained batch script: downloads both datasets, repeats the data
+      preparation, runs FindIntegrationAnchors() + IntegrateData() and the
+      label transfer, and saves crossdataset-integration_results.RData. It
+      does not install packages -- it checks they are present and stops with
+      the install line if not. Nothing downstream (no scaling, PCA, UMAP or
+      plots); those stay in the .Rmd where you can see their output.
+      Not meant to be read line by line in RStudio, unlike everything else here.
+
+  crossdataset-integration_server.slurm
+      The SLURM job description for the above. You MUST fill in --account and
+      --partition for your own cluster; the rest has working defaults
+      (4 cores, 128G, 4 hours). Submit with:
+          sbatch crossdataset-integration_server.slurm
+      then copy the result back to sit next to the .Rmd:
+          scp you@server:/path/to/crossdataset-integration_results.RData .
+      The .Rmd stops with an instruction if it cannot find that file, and
+      checks that the object inside it describes the same nuclei your own
+      machine selected before it uses it.
+
 DATA: the first two tutorials download seaad_microglia.RData (525 MB)
 themselves into a temporary folder, so they run as-is with nothing to set up.
 The third downloads that file plus rosmap_microglia.RData. The first run of
@@ -49,12 +75,11 @@ region was matched to SEA-AD's on purpose: pairing SEA-AD MTG against ROSMAP's
 much larger PFC subset would have made "study" and "brain region" the same
 variable.
 
-  ** NOT YET LIVE ** crossdataset-integration_tutorial.Rmd currently carries a
-  PLACEHOLDER Dropbox link and a zero byte-count for rosmap_microglia.RData,
-  and cannot knit until they are filled in. Build the file with
-  private/code/rosmap/prep_rosmap_microglia_claude.R, upload it, and paste the
-  dl=1 link and the printed byte count into the download_rosmap chunk (then
-  regenerate the .R).
+  Both download links were checked on 2026-08-20 and are live: the SEA-AD file
+  returns 525,672,784 bytes and the ROSMAP file 1,507,998,516 bytes, matching
+  the sizes the scripts assert. The third tutorial has still never been knitted,
+  so unlike the first two, no number in its prose has been checked against a
+  render yet.
 
 NOTE ON THE DOWNLOAD: R's default download.file() timeout is 60 seconds, which
 is nowhere near enough for 525 MB. The tutorials set options(timeout = 3600) and

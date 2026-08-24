@@ -19,8 +19,10 @@ knitr::dep_auto()
 ```
 
 > **A note on `cache = TRUE` and `autodep`.** As with the other two Week 4
-> documents, every chunk is cached, so the first knit takes a long time and every
-> later one takes a couple of minutes. Chunks whose only output is a figure are
+> documents, every chunk is cached, so later knits take a couple of minutes. The
+> slowest step in this document does not run here at all — see *Running the slow
+> step somewhere else* below — so the first knit is dominated by the two
+> downloads rather than by computation. Chunks whose only output is a figure are
 > marked `cache=FALSE`, because a `ggplot` object stores the environment it was
 > built in and caching one can drag a copy of the whole Seurat object onto disk.
 > `autodep = TRUE` plus `knitr::dep_auto()` makes `knitr` re-run a chunk when the
@@ -60,6 +62,17 @@ straight into `FeaturePlot()`, `DotPlot()`, or — and this is the whole point o
 the tutorial — into `FindMarkers()`, where it will cheerfully give you p-values
 that mean nothing.
 
+**And there is a third thing, which is not about integration at all.** Finding
+anchors between two studies takes half an hour and a great deal of memory, which
+is more than a laptop should be asked for in the middle of a session. So this
+document is split: the slow calls are shown here but not run here. They live in
+`crossdataset-integration_server.R`, which you submit to a cluster with
+`crossdataset-integration_server.slurm`, and which writes one file that you copy
+back and load. **Getting a long-running R job off your laptop and onto a server
+is a workshop goal in its own right**, and it is the part of this tutorial that
+transfers directly to your own data — every attendee with a dataset larger than a
+few thousand cells will need it, whatever method they end up running.
+
 The plan:
 
 | Stage | What it produces | Function |
@@ -67,12 +80,14 @@ The plan:
 | 1. Make the two objects comparable | Shared barcodes, shared genes, comparable sizes | `RenameCells()`, `subset()` |
 | 2. Look at them uncorrected | A UMAP with one island per study | `merge()`, `RunPCA()`, `RunUMAP()` |
 | 3. Measure the separation | A per-cell batch-mixing score, against its null | `RANN::nn2()` |
-| 4. Find anchors | Pairs of cells the method believes are the same cell | `FindIntegrationAnchors()` |
-| 5. Correct the expression | A new **assay**, `integrated`, of corrected values | `IntegrateData()` |
-| 6. Look inside it | Fewer genes, no counts, and negative numbers | `LayerData()` |
-| 7. Re-embed, and re-measure | The same mixing score, on corrected values | `RunPCA()`, `RunUMAP()` |
-| 8. Go back to the counts | The assay you actually test on | `JoinLayers()` |
-| 9. The alternative | Reference labels moved onto the query, counts untouched | `TransferData()` |
+| 4. Send the slow part to a server | A batch job, and one file to copy back | `sbatch`, `scp` |
+| 5. Find anchors *(on the server)* | Pairs of cells the method believes are the same cell | `FindIntegrationAnchors()` |
+| 6. Correct the expression *(on the server)* | A new **assay**, `integrated`, of corrected values | `IntegrateData()` |
+| 7. Load the result, and check it | The server's object, verified against your own | `load()`, `identical()` |
+| 8. Look inside it | Fewer genes, no counts, and negative numbers | `LayerData()` |
+| 9. Re-embed, and re-measure | The same mixing score, on corrected values | `RunPCA()`, `RunUMAP()` |
+| 10. Go back to the counts | The assay you actually test on | `JoinLayers()` |
+| 11. The alternative *(on the server)* | Reference labels moved onto the query, counts untouched | `TransferData()` |
 
 > **Where this sits in the workshop.** This is the second half of batch
 > correction. **Week 3** produced an integrated reduction on nine PBMC protocols
@@ -152,10 +167,6 @@ file.size(seaad_file) == seaad_size
 ```
 
 ```{r download_rosmap}
-## TODO(Kevin): run private/code/rosmap/prep_rosmap_microglia_claude.R, upload
-## the .RData it writes, and replace the two placeholder values below with the
-## dl=1 share link and the byte count the script prints. This chunk cannot run
-## until then. Delete this comment afterwards.
 rosmap_url <- paste0("https://www.dropbox.com/scl/fi/siecgiljoks48pkin42ts/",
                      "rosmap_microglia.RData",
                      "?rlkey=vwnmoeynhbsuxkiumz36hy301&dl=1")
@@ -482,13 +493,115 @@ this embedding is which lab sequenced it.
 > Week 3 insisted on holding a cell-type label fixed *before* integrating.
 > Read this number only alongside a picture that still has structure in it.
 
+# Running the slow step somewhere else
+
+Everything so far has been cheap. The next two calls are not: on two datasets of
+ten thousand nuclei, `FindIntegrationAnchors()` and `IntegrateData()` together
+take upwards of half an hour and want more memory than most laptops have. That
+is a normal size for this kind of work, and it is the point at which analysis
+stops being something you do in the RStudio console and becomes something you
+*submit*.
+
+Two files in this folder do that:
+
+| File | What it is |
+|---|---|
+| `crossdataset-integration_server.R` | A self-contained R script. It downloads the two datasets, repeats the preparation above, runs the two slow calls plus the label transfer at the end of this tutorial, and saves one `.RData`. Nothing else. |
+| `crossdataset-integration_server.slurm` | The job description the scheduler reads: which account to bill, how much memory, how long, where to write the logs. |
+
+## The shape of a cluster job
+
+A cluster is a few hundred machines with one queue in front of them, managed by
+a **scheduler** — SLURM here, and on Hyak, and on the SCRI HPC. You do not run
+your work on the machine you log into. That machine, the **login node**, is
+shared by everyone and is for editing files and submitting jobs; running a job
+of this size on it will slow the cluster down for everybody and get you a polite
+email. You describe the work instead, hand the description to the scheduler, and
+it finds you a compute node.
+
+The description is the `.slurm` file. Everything in it beginning with `#SBATCH`
+looks like a comment to the shell and is in fact a directive to the scheduler:
+
+```
+#SBATCH --account=YOUR_ACCOUNT
+#SBATCH --partition=YOUR_PARTITION
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=4:00:00
+#SBATCH --output=crossdataset-integration_%j.out
+```
+
+The account and the partition are the two you cannot guess — they are specific
+to your group and your cluster, and the job is rejected outright without them.
+The rest is a bargain you are striking with the queue: ask for more than you
+need and you wait longer to start; ask for less and you are killed part-way with
+nothing saved.
+
+Then, on the server, from the folder holding both files:
+
+```
+sbatch crossdataset-integration_server.slurm    # returns a job ID
+squeue -u $USER                                 # PD = pending, R = running
+scancel JOBID                                   # change your mind
+```
+
+and when it finishes, from your **own** machine:
+
+```
+scp you@server:/path/to/crossdataset-integration_results.RData .
+```
+
+> **A job that dies with no R error in the log is almost always the memory
+> limit.** When R hits an error, it says so, and the message lands in the `.err`
+> file with a traceback you can read. When the job exceeds `--mem`, the kernel
+> stops the process outright — R never gets a chance to complain, so the `.out`
+> file simply stops mid-sentence and the `.err` file holds a scheduler line about
+> an out-of-memory event and nothing else. The first time this happens it reads
+> like the job vanished. Raise `--mem` and resubmit. The same applies to
+> `--time`, which at least tells you it cancelled the job.
+
+> **Anything the script prints goes to a file, not to a screen.** There is no
+> console attached to a batch job, so `cat()` and `print()` land in whatever
+> `--output` names, and a bare object name on its own line — the habit these
+> tutorials otherwise teach — prints nothing at all under `Rscript`. That is why
+> `crossdataset-integration_server.R` is written with explicit `cat()` calls, and
+> why it times the two slow steps and reports them: the log is the only place you
+> can find out where the time went. Watch it live with
+> `tail -f crossdataset-integration_JOBID.out`.
+
+## What to put on the server, and what not to
+
+The server script stops immediately after the expensive calls. It does not scale
+the data, run PCA, run UMAP, or make a single plot, even though the tutorial does
+all of those below. That division is deliberate and it is the useful habit:
+
+**Put the expensive, settled steps on the server. Keep the cheap, undecided ones
+in front of you.** Every choice you have not made yet — how many dimensions to
+embed, which resolution, which gene to look at — is a choice you will want to
+change three times, and each change costs a queue wait if it lives inside a batch
+job. Seconds of work belong where you can see their output.
+
+The other half of that habit is that the script **checks its assumptions at the
+top**. It verifies the packages are installed before doing anything, and stops
+with the `install.packages()` line to paste if they are not. A batch job that
+fails at minute forty because one package is missing has spent forty minutes of
+queue time to tell you something it could have told you in the first second.
+
 # Integrating so that the expression matrix is corrected too
 
 Week 3's `IntegrateLayers()` takes an object and returns a reduction. The older
 two-step route takes a **list** of objects and returns a new object carrying a
 second assay.
 
-```{r find_anchors}
+The next two chunks are the ones that run on the server. They are shown here in
+full — this is the code, not a summary of it — but they are marked `eval=FALSE`,
+so knitting this document does not execute them. The same two calls appear in
+`crossdataset-integration_server.R`, with `1:30` written there as `1:n_dims` so
+that it is a setting at the top of the file rather than a number buried in the
+middle of one.
+
+```{r find_anchors, eval=FALSE}
+# Runs on the server, not here. See crossdataset-integration_server.R.
 integration_anchors <- Seurat::FindIntegrationAnchors(
   object.list = list(seaad, rosmap),
   anchor.features = integration_features,
@@ -499,22 +612,19 @@ integration_anchors <- Seurat::FindIntegrationAnchors(
 class(integration_anchors)
 ```
 
-This is the slow step — expect several minutes. Canonical correlation analysis
+This is the slow step — this is the half hour. Canonical correlation analysis
 finds directions of variation *shared* between the two datasets rather than
 maximal within either; pairs of cells that are mutual nearest neighbours in that
 shared space become **anchors**. An anchor is the method's assertion that *this*
 SEA-AD nucleus and *that* ROSMAP nucleus are the same kind of cell, and
 everything downstream inherits the quality of those assertions.
 
-```{r integrate_data}
+```{r integrate_data, eval=FALSE}
+# Runs on the server, not here. See crossdataset-integration_server.R.
 integrated <- Seurat::IntegrateData(anchorset = integration_anchors,
                                     new.assay.name = "integrated",
                                     dims = 1:30,
                                     verbose = FALSE)
-
-integrated
-Seurat::Assays(integrated)
-Seurat::DefaultAssay(integrated)
 ```
 
 For each anchor pair, Seurat computes a correction vector — the difference
@@ -530,6 +640,88 @@ made of expression data, that is not expression data.
 > most common way the mistake this tutorial is about actually happens: nobody
 > decides to test genes on integrated data, they just never set `DefaultAssay()`
 > back.
+
+# Bringing the result back
+
+The job has finished, the `.RData` has been copied back, and from here everything
+runs on your own machine again.
+
+```{r results_file}
+results_file <- "crossdataset-integration_results.RData"
+
+# The default looks for the file next to this document. If you put it somewhere
+# else, point at it here, e.g.:
+# results_file <- "/path/to/crossdataset-integration_results.RData"
+
+if (!file.exists(results_file)) {
+  stop("Cannot find ", results_file, ". Run crossdataset-integration_server.R ",
+       "on a server (see the previous section) and copy the file it writes ",
+       "next to this document.", call. = FALSE)
+}
+```
+
+That check is worth having. Without it the failure surfaces two chunks later as
+`object 'integrated' not found`, which points at the wrong thing entirely.
+
+Before loading, stash the two objects the file is about to overwrite.
+
+```{r stash_local}
+local_seaad_cells <- seaad_cells
+local_features <- integration_features
+```
+
+> **This is the `load()` problem from the top of the tutorial, arriving on
+> schedule.** The server script named its variables the same way this document
+> does — that is what makes the two halves comparable — so `seaad_cells` and
+> `integration_features` already exist here and `load()` will replace both
+> without a word. That is normally a hazard. Here it is exactly what we want,
+> because having the server's version *and* our own is what lets us check that
+> the two machines agree. Copy them somewhere safe first, then load.
+
+```{r load_server_results}
+load(results_file)
+
+ls()
+run_info
+```
+
+```{r verify_server_results}
+# Did both machines draw the same 10,000 nuclei, and select the same genes?
+identical(local_seaad_cells, seaad_cells)
+identical(local_features, integration_features)
+
+# And does the object that came back describe the cells we have in front of us?
+setequal(Seurat::Cells(integrated),
+         c(Seurat::Cells(seaad), Seurat::Cells(rosmap)))
+
+stopifnot(identical(local_seaad_cells, seaad_cells),
+          setequal(Seurat::Cells(integrated),
+                   c(Seurat::Cells(seaad), Seurat::Cells(rosmap))))
+```
+
+> **Do not skip this, and do not assume it.** The prepared objects in front of
+> you were built here; the corrected assay was built on a different machine, with
+> a different R, possibly a different Seurat. Everything below silently assumes
+> the two agree about which nuclei are which. They do agree, because
+> `set.seed(10)` followed by `sample()` gives the same answer on any machine
+> running R 3.6.0 or later — that release changed the default sampling algorithm,
+> and the change is the reason `RNGkind()` is worth recording. But "should be
+> reproducible" is a claim, and a claim you can check in three lines for free is
+> one you should check. `run_info` above says what the server actually ran.
+>
+> If a check fails, the usual cause is that the two scripts drifted — someone
+> changed `n_cells`, or the gene intersection, on one side only. The fix is to
+> resubmit the job, not to force the objects together.
+
+```{r inspect_loaded}
+integrated
+Seurat::Assays(integrated)
+Seurat::DefaultAssay(integrated)
+```
+
+Note the default assay: `IntegrateData()` set it to `integrated` on the server,
+and that travelled here inside the object. The trap in the callout above is not
+something you can leave behind by changing machines.
 
 ```{r join_rna_layers}
 SeuratObject::Layers(integrated[["RNA"]])
@@ -791,7 +983,13 @@ it does not require correcting anything. **What are my cells, in someone else's
 vocabulary?** ROSMAP's nuclei have `state` labels; SEA-AD's have `Supertype`
 labels; the question is how they correspond.
 
-```{r transfer_anchors}
+This runs on the server too. `FindTransferAnchors()` is the same anchor
+machinery as `FindIntegrationAnchors()` — a different question asked of the same
+kind of search — so it is slow for the same reason, and it was computed by the
+same job. `predictions_df` came back in the `.RData` you loaded above.
+
+```{r transfer_anchors, eval=FALSE}
+# Runs on the server, not here. See crossdataset-integration_server.R.
 transfer_anchors <- Seurat::FindTransferAnchors(reference = seaad,
                                                 query = rosmap,
                                                 dims = 1:30,
@@ -801,7 +999,9 @@ predictions_df <- Seurat::TransferData(anchorset = transfer_anchors,
                                        refdata = seaad$Supertype,
                                        dims = 1:30,
                                        verbose = FALSE)
+```
 
+```{r inspect_predictions}
 dim(predictions_df)
 utils::head(colnames(predictions_df))
 utils::head(predictions_df[, c("predicted.id", "prediction.score.max")], 5)
@@ -881,6 +1081,16 @@ shows.
   how the tissue was collected and processed. Integration will always produce
   output. Whether the aligned populations are the same biology is a claim the
   method cannot make for you.
+- **Almost everything about the cluster.** We submitted one job, waited, and
+  copied one file back. Not covered: `srun` for an *interactive* session on a
+  compute node, which is where you should debug a script before ever calling
+  `sbatch`; `future::plan("multicore")`, without which Seurat ignores the cores
+  you asked for; job arrays, for running the same script over twenty samples;
+  saving intermediate objects so a job that dies at minute fifty does not start
+  from zero; and containers, which are how you make "the same R" mean the same
+  thing on your laptop and on the cluster. How R is made available at all —
+  `module load`, conda, a container — differs by cluster, and there is no answer
+  that is right everywhere.
 - **Cleaning.** Both objects arrive filtered by their authors, so **Week 2**'s
   ambient RNA and doublet work is invisible here. It comes first on your own data,
   and it comes first *per study* — ambient RNA profiles are study-specific.
