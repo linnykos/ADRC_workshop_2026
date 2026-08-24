@@ -112,8 +112,7 @@ load(seaad_file)
 load(rosmap_file)
 
 seaad <- seurat_obj
-rosmap <- rosmap_obj
-rm(list = c("seurat_obj", "rosmap_obj")); gc(TRUE)
+rm(list = c("seurat_obj")); gc(TRUE)
 
 # Making the two objects comparable --------------------------------------------
 

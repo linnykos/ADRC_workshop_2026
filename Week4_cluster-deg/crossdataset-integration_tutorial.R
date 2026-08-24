@@ -69,8 +69,7 @@ load(rosmap_file)
 ls()
 
 seaad <- seurat_obj
-rosmap <- rosmap_obj
-rm(list = c("seurat_obj", "rosmap_obj")); gc(TRUE)
+rm(list = c("seurat_obj")); gc(TRUE)
 
 seaad
 rosmap
